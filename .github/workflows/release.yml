@@ -66,6 +66,11 @@ jobs:
           printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/lightious-release.jks"
           keytool -list -keystore "$RUNNER_TEMP/lightious-release.jks" \
             -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null
+          expected_signer="$(keytool -exportcert \
+            -keystore "$RUNNER_TEMP/lightious-release.jks" \
+            -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" \
+            | sha256sum | awk '{print $1}')"
+          echo "EXPECTED_SIGNER_SHA256=$expected_signer" >> "$GITHUB_ENV"
 
       - name: Run tests and build signed release APK
         working-directory: lightious
@@ -104,6 +109,11 @@ jobs:
           signer="$(awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2; exit}' "$RUNNER_TEMP/apksigner.txt")"
           if [ -z "$signer" ]; then
             echo "could not read signer certificate digest"
+            exit 1
+          fi
+          normalized_signer="$(printf '%s' "$signer" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          if [ "$normalized_signer" != "$EXPECTED_SIGNER_SHA256" ]; then
+            echo "release APK signer does not match the configured Lightious release key"
             exit 1
           fi
 
