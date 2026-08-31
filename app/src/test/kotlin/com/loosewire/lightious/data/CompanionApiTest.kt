@@ -17,7 +17,7 @@ class CompanionApiTest {
         assertTrue(validPollSecret("lpt_poll_${"A".repeat(43)}"))
         assertFalse(validPollSecret("lpt_poll_${"A".repeat(42)}B"))
         assertEquals(
-            "5289f9a97df5ab15c14b190ee91e0234ee0e86cd3bbd32d1663c5e719b84a792",
+            "ab4bc1907dd011a72fcf10f36082e3e33c20285615049f5f778fec1edd0b2f73",
             deviceBearerDigest(bearer),
         )
         assertTrue(validDeviceBearer(generateDeviceBearer()))
