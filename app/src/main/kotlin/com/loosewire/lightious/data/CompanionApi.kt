@@ -4,13 +4,13 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.accept
-import io.ktor.client.request.contentType
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -215,7 +215,7 @@ private class KtorCompanionHttpTransport : CompanionHttpTransport {
     ): InvidiousHttpResponse {
         val response = client.post(url) {
             accept(ContentType.Application.Json)
-            contentType(ContentType.Application.Json)
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
             headers.forEach { (name, value) -> header(name, value) }
             setBody(body)
         }

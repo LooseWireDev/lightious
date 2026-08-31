@@ -210,6 +210,7 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     override fun Content() {
         val colors by LightThemeController.colors.collectAsState()
         val state by viewModel.uiState.collectAsState()
+        val companionProfile = state.companion.profile
 
         LightTheme(colors = colors) {
             Box(
@@ -220,8 +221,8 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                 when (val mode = state.mode) {
                     is HomeMode.Loading -> LoadingContent(mode.message)
                     HomeMode.Ready -> when {
-                        state.companion.profile?.mode == ExperienceMode.FOCUSED -> FocusedHomeContent(
-                            videos = state.companion.profile.items,
+                        companionProfile?.mode == ExperienceMode.FOCUSED -> FocusedHomeContent(
+                            videos = companionProfile.items,
                             onVideo = ::openFocusedVideo,
                             onRefresh = viewModel::reload,
                             onSettings = ::openSettings,
