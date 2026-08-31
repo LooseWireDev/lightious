@@ -77,8 +77,9 @@ internal interface TokenCipher {
     fun decrypt(blob: ByteArray): String
 }
 
-private class AndroidTokenCipher(
-    private val keyStore: LightiousTokenKeyStore = LightiousTokenKeyStore(),
+internal class AndroidTokenCipher(
+    keyAlias: String = LEGACY_ACCOUNT_KEY_ALIAS,
+    private val keyStore: LightiousTokenKeyStore = LightiousTokenKeyStore(keyAlias),
 ) : TokenCipher {
     init {
         keyStore.ensureKey()
@@ -114,11 +115,14 @@ private class AndroidTokenCipher(
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_IV_LENGTH = 12
         const val GCM_TAG_LENGTH_BITS = 128
+        // Keep the alias used before the Lightious rename so upgrades can still
+        // decrypt existing Invidious account tokens.
+        const val LEGACY_ACCOUNT_KEY_ALIAS = "lightvidious_invidious_account_v1"
     }
 }
 
-private class LightiousTokenKeyStore(
-    private val keyAlias: String = KEY_ALIAS,
+internal class LightiousTokenKeyStore(
+    private val keyAlias: String,
 ) {
     fun ensureKey() {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -140,13 +144,10 @@ private class LightiousTokenKeyStore(
     fun getSecretKey(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         return (keyStore.getEntry(keyAlias, null) as? KeyStore.SecretKeyEntry)?.secretKey
-            ?: error("Lightious account key is unavailable.")
+            ?: error("Lightious credential key is unavailable.")
     }
 
     private companion object {
-        // Legacy alias retained so an update can still decrypt the token saved
-        // by the earlier build with the same com.loosewire.lightious app id.
-        const val KEY_ALIAS = "lightvidious_invidious_account_v1"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 }

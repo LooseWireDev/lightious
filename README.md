@@ -18,6 +18,9 @@ page is explicitly enabled and opened.
 - Choose which pages appear on Home.
 - Select an app-wide preferred audio language.
 - Choose whether media is proxied through the configured Invidious instance.
+- Pair with the companion website using a short code—no token entry on the phone.
+- Switch between unrestricted Explore and an explicitly curated Focused library.
+- Allow each Focused item to be listened to only or watched and listened to.
 
 There is no autoplay, comments, algorithmic Home feed, notifications, or
 automatic public-instance rotation.
@@ -98,15 +101,22 @@ The workflow tests and builds the minified release, verifies its signature,
 package ID (`com.loosewire.lightious`), version code and name, writes a SHA-256
 checksum, and publishes the APK and checksum to GitHub Releases.
 
-## Account sign-in
+## Companion pairing and account sign-in
 
-The current client uses Invidious's restricted bearer-token flow and never asks
-for an account password. The token is validated against the selected instance
-and stored with AES-GCM encryption backed by the Android Keystore.
+The companion-enabled Invidious fork exposes `/lightious`. Sign in there with a
+normal Invidious account, select Explore or Focused mode, add individual videos,
+choose each video's playback permission, and approve a phone using the short
+code displayed by Lightious.
 
-This manual flow is expected to be replaced by the Lightious companion pairing
-experience. The companion service and focused, explicitly curated library are
-being developed in the separate Invidious fork.
+The phone creates its own random device credential and sends only its SHA-256
+digest when pairing begins. The credential is stored with AES-GCM encryption
+backed by the Android Keystore. Browser session cookies and account passwords
+never enter the phone app. A paired phone refreshes companion policy before
+opening a video; Focused mode denies videos not in the current curated library.
+
+The existing restricted Invidious bearer-token sign-in remains optional for
+Explore-mode account feeds and watched-history sync. It is separate from the
+companion device credential and never grants access to `/lightious` controls.
 
 ## History and privacy
 
@@ -117,7 +127,9 @@ separate confirmed clear action.
 ## Instance requirements
 
 The configured HTTPS server must expose the Invidious v1 API, video metadata,
-and a playable media URL.
+and a playable media URL. Companion pairing additionally requires the
+[`lightious` branch of `LooseWireDev/lightious-invidious`](https://github.com/LooseWireDev/lightious-invidious/tree/lightious)
+with its Lightious routes enabled and public HTTPS URL configured.
 
 `Proxy media` requests `local=true`. This keeps media traffic on the configured
 Invidious host but consumes that server's bandwidth. Turning it off normally

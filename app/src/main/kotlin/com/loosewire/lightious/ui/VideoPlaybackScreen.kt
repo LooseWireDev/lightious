@@ -238,7 +238,7 @@ class VideoPlaybackScreen(
 private fun VideoPlaybackSource.Separate.toMergedMediaSource(): MediaSource {
     val dataSourceFactory = DefaultHttpDataSource.Factory()
         .setAllowCrossProtocolRedirects(true)
-        .setUserAgent("Lightious/0.3.2")
+        .setUserAgent("Lightious/0.4.0")
     val mediaSourceFactory = ProgressiveMediaSource.Factory(dataSourceFactory)
     return MergingMediaSource(
         true,

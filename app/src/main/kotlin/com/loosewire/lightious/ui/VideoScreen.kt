@@ -15,6 +15,7 @@ import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
 import com.loosewire.lightious.data.ClientSettings
 import com.loosewire.lightious.data.InvidiousApi
+import com.loosewire.lightious.data.PlaybackPolicy
 import com.loosewire.lightious.data.StreamSelection
 import com.loosewire.lightious.data.VideoDetails
 import com.loosewire.lightious.data.VideoPlaybackSource
@@ -53,7 +54,10 @@ import kotlinx.coroutines.launch
 
 sealed interface VideoMode {
     data object Loading : VideoMode
-    data class Loaded(val details: VideoDetails) : VideoMode
+    data class Loaded(
+        val details: VideoDetails,
+        val playbackPolicy: PlaybackPolicy,
+    ) : VideoMode
     data class Failed(val message: String) : VideoMode
 }
 
@@ -90,9 +94,23 @@ class VideoViewModel(
     fun load() {
         _uiState.value = VideoUiState(mode = VideoMode.Loading)
         viewModelScope.launch(Dispatchers.IO) {
+            val access = services.companion.authorizePlayback(
+                api.baseUrl,
+                initialVideo.videoId,
+            )
+            if (!access.allowed || access.policy == null) {
+                _uiState.value = VideoUiState(
+                    mode = VideoMode.Failed(
+                        access.message ?: "The companion did not allow this video.",
+                    ),
+                )
+                return@launch
+            }
             api.video(initialVideo.videoId).fold(
                 onSuccess = { details ->
-                    _uiState.value = VideoUiState(mode = VideoMode.Loaded(details))
+                    _uiState.value = VideoUiState(
+                        mode = VideoMode.Loaded(details, access.policy),
+                    )
                 },
                 onFailure = { error ->
                     _uiState.value = VideoUiState(
@@ -146,7 +164,9 @@ class VideoViewModel(
     fun pauseForVideo() = player.pause()
 
     fun recordVideoPlayback() {
-        val details = (_uiState.value.mode as? VideoMode.Loaded)?.details ?: return
+        val loaded = _uiState.value.mode as? VideoMode.Loaded ?: return
+        if (loaded.playbackPolicy != PlaybackPolicy.WATCH_AND_LISTEN) return
+        val details = loaded.details
         recordPlayback(details.summary)
     }
 
@@ -232,6 +252,7 @@ class VideoScreen(
                         is VideoMode.Loaded -> {
                             VideoDetailsContent(
                                 details = mode.details,
+                                playbackPolicy = mode.playbackPolicy,
                                 audioPlaying = audioPlaying,
                                 audioPositionMs = audioPosition,
                                 audioDurationMs = audioDuration,
@@ -240,6 +261,7 @@ class VideoScreen(
                             )
                             VideoActions(
                                 details = mode.details,
+                                playbackPolicy = mode.playbackPolicy,
                                 audioStarted = audioStarted,
                                 audioPlaying = audioPlaying,
                                 onWatch = { source ->
@@ -314,6 +336,7 @@ private fun VideoFailureContent(
 @Composable
 private fun VideoDetailsContent(
     details: VideoDetails,
+    playbackPolicy: PlaybackPolicy,
     audioPlaying: Boolean,
     audioPositionMs: Long,
     audioDurationMs: Long,
@@ -345,7 +368,11 @@ private fun VideoDetailsContent(
             modifier = Modifier.padding(top = 0.25f.gridUnitsAsDp()),
         )
         LightText(
-            text = streamLabel(details.selection),
+            text = if (playbackPolicy == PlaybackPolicy.LISTEN_ONLY) {
+                "LISTEN ONLY"
+            } else {
+                streamLabel(details.selection)
+            },
             variant = LightTextVariant.Superfine,
             lighten = true,
             modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()),
@@ -380,6 +407,7 @@ private fun VideoDetailsContent(
 @Composable
 private fun VideoActions(
     details: VideoDetails,
+    playbackPolicy: PlaybackPolicy,
     audioStarted: Boolean,
     audioPlaying: Boolean,
     onWatch: (VideoPlaybackSource) -> Unit,
@@ -388,43 +416,59 @@ private fun VideoActions(
     onSkipBack: () -> Unit,
     onSkipForward: () -> Unit,
 ) {
+    val watchSource = if (playbackPolicy == PlaybackPolicy.WATCH_AND_LISTEN) {
+        details.watchSource
+    } else {
+        null
+    }
     if (audioStarted) {
         LightBottomBar(
-            items = listOf(
-                LightBarButton.LightIcon(
-                    icon = LightIcons.SKIP_BACKWARD_FIFTEEN,
-                    onClick = onSkipBack,
-                    contentDescription = "Back 15 seconds",
-                ),
-                LightBarButton.LightIcon(
-                    icon = if (audioPlaying) LightIcons.PAUSE else LightIcons.PLAY,
-                    onClick = onToggleAudio,
-                    contentDescription = if (audioPlaying) "Pause" else "Play",
-                ),
-                LightBarButton.LightIcon(
-                    icon = LightIcons.SKIP_FORWARD_FIFTEEN,
-                    onClick = onSkipForward,
-                    contentDescription = "Forward 15 seconds",
-                ),
-                LightBarButton.LightIcon(
-                    icon = LightIcons.MEDIA,
-                    onClick = details.watchSource?.let { source -> { onWatch(source) } },
-                    contentDescription = "Watch video",
-                ),
-            ),
+            items = buildList {
+                add(
+                    LightBarButton.LightIcon(
+                        icon = LightIcons.SKIP_BACKWARD_FIFTEEN,
+                        onClick = onSkipBack,
+                        contentDescription = "Back 15 seconds",
+                    ),
+                )
+                add(
+                    LightBarButton.LightIcon(
+                        icon = if (audioPlaying) LightIcons.PAUSE else LightIcons.PLAY,
+                        onClick = onToggleAudio,
+                        contentDescription = if (audioPlaying) "Pause" else "Play",
+                    ),
+                )
+                add(
+                    LightBarButton.LightIcon(
+                        icon = LightIcons.SKIP_FORWARD_FIFTEEN,
+                        onClick = onSkipForward,
+                        contentDescription = "Forward 15 seconds",
+                    ),
+                )
+                watchSource?.let { source ->
+                    add(
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.MEDIA,
+                            onClick = { onWatch(source) },
+                            contentDescription = "Watch video",
+                        ),
+                    )
+                }
+            },
         )
     } else {
         LightBottomBar(
-            items = listOf(
-                LightBarButton.Text(
-                    text = "WATCH",
-                    onClick = details.watchSource?.let { source -> { onWatch(source) } },
-                ),
-                LightBarButton.Text(
-                    text = "LISTEN",
-                    onClick = onListen.takeIf { details.audioUrl != null },
-                ),
-            ),
+            items = buildList {
+                watchSource?.let { source ->
+                    add(LightBarButton.Text(text = "WATCH", onClick = { onWatch(source) }))
+                }
+                add(
+                    LightBarButton.Text(
+                        text = "LISTEN",
+                        onClick = onListen.takeIf { details.audioUrl != null },
+                    ),
+                )
+            },
         )
     }
 }

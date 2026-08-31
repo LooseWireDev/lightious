@@ -18,6 +18,9 @@ import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
 import com.loosewire.lightious.data.AccountSession
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.CompanionState
+import com.loosewire.lightious.data.CuratedVideo
+import com.loosewire.lightious.data.ExperienceMode
 import com.loosewire.lightious.data.HomePage
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.normalizeInstanceUrl
@@ -62,6 +65,7 @@ sealed interface HomeMode {
 data class HomeUiState(
     val settings: ClientSettings = ClientSettings(),
     val account: AccountSession? = null,
+    val companion: CompanionState = CompanionState(),
     val mode: HomeMode = HomeMode.Loading("Loading…"),
     val errorMessage: String? = null,
 )
@@ -106,10 +110,33 @@ class HomeViewModel(
             } catch (_: Exception) {
                 null
             }
+            val cachedCompanion = try {
+                services.companion.load(settings.instanceUrl)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                CompanionState()
+            }
+            var companion = cachedCompanion
+            var syncError: String? = null
+            if (cachedCompanion.session != null) {
+                services.companion.sync(settings.instanceUrl).fold(
+                    onSuccess = { profile -> companion = cachedCompanion.copy(profile = profile) },
+                    onFailure = { error ->
+                        // A paired Home must not display a stale Focused library.
+                        // Playback also revalidates, but visibility is part of the
+                        // companion contract rather than a security boundary.
+                        companion = cachedCompanion.copy(profile = null)
+                        syncError = error.userMessage("Could not sync the companion.")
+                    },
+                )
+            }
             _uiState.value = HomeUiState(
                 settings = settings,
                 account = account,
+                companion = companion,
                 mode = HomeMode.Ready,
+                errorMessage = syncError,
             )
         }
     }
@@ -192,16 +219,22 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
             ) {
                 when (val mode = state.mode) {
                     is HomeMode.Loading -> LoadingContent(mode.message)
-                    HomeMode.Ready -> HomeMenuContent(
-                        settings = state.settings,
-                        signedIn = state.account != null,
-                        onPage = ::openPage,
-                        onSettings = {
-                            navigateTo(
-                                screenFactory = { activity -> SettingsScreen(activity, services) },
-                            )
-                        },
-                    )
+                    HomeMode.Ready -> when {
+                        state.companion.profile?.mode == ExperienceMode.FOCUSED -> FocusedHomeContent(
+                            videos = state.companion.profile.items,
+                            onVideo = ::openFocusedVideo,
+                            onRefresh = viewModel::reload,
+                            onSettings = ::openSettings,
+                        )
+                        state.companion.session != null && state.companion.profile == null ->
+                            CompanionUnavailableContent(onRefresh = viewModel::reload, onSettings = ::openSettings)
+                        else -> HomeMenuContent(
+                            settings = state.settings,
+                            signedIn = state.account != null,
+                            onPage = ::openPage,
+                            onSettings = ::openSettings,
+                        )
+                    }
                     is HomeMode.InstanceEditor -> InitialInstanceEditor(mode, viewModel)
                 }
 
@@ -231,6 +264,101 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                     screenFactory = { activity -> SearchHistoryScreen(activity, services) },
                 )
         }
+    }
+
+    private fun openSettings() {
+        navigateTo(screenFactory = { activity -> SettingsScreen(activity, services) })
+    }
+
+    private fun openFocusedVideo(video: CuratedVideo) {
+        navigateTo(
+            screenFactory = { activity ->
+                VideoScreen(activity, viewModel.uiState.value.settings, video.asVideoSummary(), services)
+            },
+        )
+    }
+}
+
+@Composable
+private fun FocusedHomeContent(
+    videos: List<CuratedVideo>,
+    onVideo: (CuratedVideo) -> Unit,
+    onRefresh: () -> Unit,
+    onSettings: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        LightTopBar(
+            center = LightTopBarCenter.Text("Focused"),
+            rightButton = LightBarButton.LightIcon(
+                icon = LightIcons.SETTINGS,
+                onClick = onSettings,
+                contentDescription = "Settings",
+            ),
+        )
+        LightScrollView(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 1f.gridUnitsAsDp()),
+        ) {
+            if (videos.isEmpty()) {
+                LightText(
+                    text = "Your Focused library is empty. Send a video from the Lightious companion website.",
+                    variant = LightTextVariant.Copy,
+                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                )
+            } else {
+                videos.forEach { video -> VideoRow(video.asVideoSummary()) { onVideo(video) } }
+            }
+        }
+        LightBottomBar(
+            items = listOf(
+                LightBarButton.LightIcon(
+                    icon = LightIcons.REFRESH,
+                    onClick = onRefresh,
+                    contentDescription = "Sync",
+                ),
+            ),
+        )
+    }
+}
+
+@Composable
+private fun CompanionUnavailableContent(
+    onRefresh: () -> Unit,
+    onSettings: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        LightTopBar(
+            center = LightTopBarCenter.Text("Lightious"),
+            rightButton = LightBarButton.LightIcon(
+                icon = LightIcons.SETTINGS,
+                onClick = onSettings,
+                contentDescription = "Settings",
+            ),
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 1f.gridUnitsAsDp()),
+            contentAlignment = Alignment.Center,
+        ) {
+            LightText(
+                text = "Sync is required before this paired phone can open videos.",
+                variant = LightTextVariant.Copy,
+                align = TextAlign.Center,
+            )
+        }
+        LightBottomBar(
+            items = listOf(
+                LightBarButton.LightIcon(
+                    icon = LightIcons.REFRESH,
+                    onClick = onRefresh,
+                    contentDescription = "Sync",
+                ),
+            ),
+        )
     }
 }
 

@@ -19,6 +19,7 @@ import com.loosewire.lightious.LightiousServices
 import com.loosewire.lightious.data.AccountSession
 import com.loosewire.lightious.data.AudioLanguagePreference
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.CompanionState
 import com.loosewire.lightious.data.HomePage
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.authTokenAllowsHistoryWrite
@@ -58,6 +59,7 @@ import kotlinx.coroutines.withContext
 data class SettingsUiState(
     val settings: ClientSettings = ClientSettings(),
     val signedIn: Boolean = false,
+    val companion: CompanionState = CompanionState(),
     val loading: Boolean = true,
     val errorMessage: String? = null,
 )
@@ -81,6 +83,7 @@ class SettingsViewModel(
                 _uiState.value = SettingsUiState(
                     settings = settings,
                     signedIn = services.accounts.load(settings.instanceUrl) != null,
+                    companion = services.companion.load(settings.instanceUrl),
                     loading = false,
                 )
             } catch (error: CancellationException) {
@@ -173,6 +176,11 @@ class SettingsScreen(
                                 screenFactory = { activity -> AccountScreen(activity, services) },
                             )
                         },
+                        onCompanion = {
+                            navigateTo(
+                                screenFactory = { activity -> CompanionScreen(activity, services) },
+                            )
+                        },
                         onPages = {
                             navigateTo(
                                 screenFactory = { activity -> HomePagesScreen(activity, services) },
@@ -208,6 +216,7 @@ private fun SettingsContent(
     onBack: () -> Unit,
     onInstance: () -> Unit,
     onAccount: () -> Unit,
+    onCompanion: () -> Unit,
     onPages: () -> Unit,
     onAudioLanguage: () -> Unit,
     onProxy: () -> Unit,
@@ -229,6 +238,15 @@ private fun SettingsContent(
                 .padding(horizontal = 1f.gridUnitsAsDp()),
         ) {
             SettingRow("INVIDIOUS SERVER", state.settings.instanceUrl, onInstance)
+            SettingRow(
+                "COMPANION",
+                when {
+                    state.companion.session == null -> "NOT PAIRED"
+                    state.companion.profile == null -> "PAIRED · SYNC NEEDED"
+                    else -> "PAIRED · ${state.companion.profile.mode.name}"
+                },
+                onCompanion,
+            )
             SettingRow(
                 "ACCOUNT",
                 if (state.signedIn) "SIGNED IN" else "NOT SIGNED IN",
@@ -765,7 +783,11 @@ class InstanceEditorViewModel(
                                 services.history.clearPendingServerWatches(account.accountKey)
                             }
                         } finally {
-                            services.accounts.clear()
+                            try {
+                                services.accounts.clear()
+                            } finally {
+                                services.companion.forget()
+                            }
                         }
                     }
                 }
