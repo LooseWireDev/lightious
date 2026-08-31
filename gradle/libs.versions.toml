@@ -1,0 +1,26 @@
+[versions]
+agp = "8.12.3"
+kotlin = "2.3.20"
+ksp = "2.3.6"
+media3 = "1.10.1"
+room = "2.7.0"
+sdk = "0.1.1"
+
+[libraries]
+# Resolved from the included Light SDK checkout via dependency substitution.
+sdk-client = { module = "com.thelightphone:client", version.ref = "sdk" }
+androidx-media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
+androidx-media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+androidx-media3-exoplayer-hls = { module = "androidx.media3:media3-exoplayer-hls", version.ref = "media3" }
+androidx-room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version = "1.10.2" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+# Resolved from the included Light SDK checkout.
+light-sdk = { id = "com.thelightphone.light-sdk" }
