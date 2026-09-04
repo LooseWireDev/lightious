@@ -88,27 +88,42 @@ class CompanionApi internal constructor(
         val dto = decode<SyncResponse>(response.body, "companion sync")
         val mode = ExperienceMode.fromWire(dto.mode)
             ?: throw InvidiousApiException("The companion returned an unknown experience mode.")
+        val items = dto.items.map(::mapSyncItem).distinctBy(CuratedVideo::videoId)
         CompanionProfile(
             deviceId = dto.deviceId,
             account = dto.account,
             revision = dto.revision,
             mode = mode,
-            items = dto.items.map { item ->
-                val policy = PlaybackPolicy.fromWire(item.playbackPolicy)
-                    ?: throw InvidiousApiException("The companion returned an unknown playback policy.")
-                require(extractYouTubeVideoId(item.videoId) == item.videoId) {
-                    "The companion returned an invalid video ID."
+            items = items,
+            channels = dto.channels.map { channel ->
+                require(validYouTubeChannelId(channel.channelId)) {
+                    "The companion returned an invalid channel ID."
                 }
-                CuratedVideo(
-                    id = item.id,
-                    videoId = item.videoId,
-                    title = item.title.ifBlank { "Untitled video" },
-                    author = item.author.ifBlank { "Unknown channel" },
-                    lengthSeconds = item.lengthSeconds.coerceAtLeast(0L),
-                    thumbnailUrl = item.thumbnailUrl?.let { resolveCompanionUrl(baseUrl, it) },
+                val policy = PlaybackPolicy.fromWire(channel.playbackPolicy)
+                    ?: throw InvidiousApiException("The companion returned an unknown playback policy.")
+                CuratedChannel(
+                    id = channel.id,
+                    channelId = channel.channelId,
+                    name = channel.name.ifBlank { "Unknown channel" },
+                    thumbnailUrl = channel.thumbnailUrl?.let { resolveCompanionUrl(baseUrl, it) },
                     playbackPolicy = policy,
                 )
-            }.distinctBy(CuratedVideo::videoId),
+            }.distinctBy(CuratedChannel::channelId),
+            playlists = dto.playlists.map { playlist ->
+                CuratedPlaylist(
+                    id = playlist.id,
+                    name = playlist.name.ifBlank { "Untitled playlist" },
+                    items = playlist.items
+                        .map(::mapSyncItem)
+                        .distinctBy(CuratedVideo::videoId),
+                )
+            }.distinctBy(CuratedPlaylist::id),
+            blockedVideoIds = dto.blockedVideoIds.mapTo(linkedSetOf()) { videoId ->
+                require(extractYouTubeVideoId(videoId) == videoId) {
+                    "The companion returned an invalid blocked video ID."
+                }
+                videoId
+            },
         )
     }
 
@@ -120,6 +135,28 @@ class CompanionApi internal constructor(
         json.decodeFromString(body)
     } catch (error: SerializationException) {
         throw InvidiousApiException("The server returned an invalid $description.", cause = error)
+    }
+
+    private fun mapSyncItem(item: SyncItemResponse): CuratedVideo {
+        val policy = PlaybackPolicy.fromWire(item.playbackPolicy)
+            ?: throw InvidiousApiException("The companion returned an unknown playback policy.")
+        require(extractYouTubeVideoId(item.videoId) == item.videoId) {
+            "The companion returned an invalid video ID."
+        }
+        val authorId = item.authorId?.takeIf(String::isNotBlank)?.also { value ->
+            require(validYouTubeChannelId(value)) { "The companion returned an invalid channel ID." }
+        }
+        return CuratedVideo(
+            id = item.id,
+            videoId = item.videoId,
+            title = item.title.ifBlank { "Untitled video" },
+            author = item.author.ifBlank { "Unknown channel" },
+            lengthSeconds = item.lengthSeconds.coerceAtLeast(0L),
+            thumbnailUrl = item.thumbnailUrl?.let { resolveCompanionUrl(baseUrl, it) },
+            playbackPolicy = policy,
+            authorId = authorId,
+            isShort = item.isShort,
+        )
     }
 }
 
@@ -159,6 +196,9 @@ private data class SyncResponse(
     val revision: Long,
     val mode: String,
     val items: List<SyncItemResponse> = emptyList(),
+    val channels: List<SyncChannelResponse> = emptyList(),
+    val playlists: List<SyncPlaylistResponse> = emptyList(),
+    val blockedVideoIds: List<String> = emptyList(),
 )
 
 @Serializable
@@ -167,9 +207,27 @@ private data class SyncItemResponse(
     val videoId: String,
     val title: String,
     val author: String,
+    val authorId: String? = null,
     val lengthSeconds: Long = 0L,
     val thumbnailUrl: String? = null,
     val playbackPolicy: String,
+    val isShort: Boolean = false,
+)
+
+@Serializable
+private data class SyncChannelResponse(
+    val id: String,
+    val channelId: String,
+    val name: String,
+    val thumbnailUrl: String? = null,
+    val playbackPolicy: String,
+)
+
+@Serializable
+private data class SyncPlaylistResponse(
+    val id: String,
+    val name: String,
+    val items: List<SyncItemResponse> = emptyList(),
 )
 
 internal interface CompanionHttpTransport {

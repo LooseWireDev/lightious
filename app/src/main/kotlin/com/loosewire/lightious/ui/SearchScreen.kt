@@ -15,8 +15,10 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.ExperienceMode
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.VideoSummary
+import com.loosewire.lightious.data.effectiveExperienceMode
 import com.loosewire.lightious.data.extractYouTubeVideoId
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -96,21 +98,40 @@ class SearchViewModel(
             _uiState.update { it.copy(errorMessage = "Enter a search or YouTube link.") }
             return
         }
-        extractYouTubeVideoId(query)?.let { videoId ->
-            _navigationTarget.value = placeholderVideo(videoId)
-            return
-        }
 
         requestJob?.cancel()
-        _uiState.update {
-            it.copy(mode = SearchMode.Loading("Searching…"), errorMessage = null)
-        }
+        _uiState.update { it.copy(mode = SearchMode.Loading("Searching…"), errorMessage = null) }
         requestJob = viewModelScope.launch(Dispatchers.IO) {
             val settings = _uiState.value.settings
+            val companion = services.companion.loadActiveState(settings.instanceUrl).getOrElse { error ->
+                editorSession += 1
+                _uiState.update {
+                    it.copy(
+                        mode = SearchMode.Editor(query, editorSession),
+                        errorMessage = error.userMessage("Could not verify companion access."),
+                    )
+                }
+                return@launch
+            }
+            if (companion.profile.effectiveExperienceMode() == ExperienceMode.FOCUSED) {
+                editorSession += 1
+                _uiState.update {
+                    it.copy(
+                        mode = SearchMode.Editor(query, editorSession),
+                        errorMessage = "Search and pasted links are disabled while Focused mode is enabled.",
+                    )
+                }
+                return@launch
+            }
+            extractYouTubeVideoId(query)?.let { videoId ->
+                _navigationTarget.value = placeholderVideo(videoId)
+                return@launch
+            }
             InvidiousApi(
-                settings.instanceUrl,
-                settings.proxyMedia,
-                settings.audioLanguage,
+                baseUrl = settings.instanceUrl,
+                proxyMedia = settings.proxyMedia,
+                deviceBearer = companion.session?.deviceBearer,
+                audioLanguage = settings.audioLanguage,
             ).use { api ->
                 api.search(query).fold(
                     onSuccess = { videos ->

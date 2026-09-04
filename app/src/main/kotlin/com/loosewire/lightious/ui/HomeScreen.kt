@@ -3,6 +3,7 @@ package com.loosewire.lightious.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -16,17 +17,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
+import com.loosewire.lightious.enqueueDownload
 import com.loosewire.lightious.data.AccountSession
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.CompanionProfile
 import com.loosewire.lightious.data.CompanionState
 import com.loosewire.lightious.data.CuratedVideo
+import com.loosewire.lightious.data.DownloadedMedia
+import com.loosewire.lightious.data.downloadJobTag
 import com.loosewire.lightious.data.ExperienceMode
+import com.loosewire.lightious.data.FocusedChannelEntry
+import com.loosewire.lightious.data.FocusedLibraryFilter
+import com.loosewire.lightious.data.FocusedPlaylistEntry
 import com.loosewire.lightious.data.HomePage
 import com.loosewire.lightious.data.InvidiousApi
+import com.loosewire.lightious.data.effectiveExperienceMode
+import com.loosewire.lightious.data.focusedChannels
+import com.loosewire.lightious.data.focusedPlaylists
 import com.loosewire.lightious.data.normalizeInstanceUrl
 import com.thelightphone.sdk.InitialScreen
+import com.thelightphone.sdk.LightJobState
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
+import com.thelightphone.sdk.LightWork
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.rememberKeyboardOptions
 import com.thelightphone.sdk.ui.LightBarButton
@@ -62,16 +75,27 @@ sealed interface HomeMode {
     ) : HomeMode
 }
 
+enum class FocusedHomeTab {
+    VIDEOS,
+    CHANNELS,
+    PLAYLISTS,
+    DOWNLOADS,
+}
+
 data class HomeUiState(
     val settings: ClientSettings = ClientSettings(),
     val account: AccountSession? = null,
     val companion: CompanionState = CompanionState(),
+    val downloads: List<DownloadedMedia> = emptyList(),
+    val focusedTab: FocusedHomeTab = FocusedHomeTab.VIDEOS,
+    val focusedFilter: FocusedLibraryFilter = FocusedLibraryFilter.ALL,
     val mode: HomeMode = HomeMode.Loading("Loading…"),
     val errorMessage: String? = null,
 )
 
 class HomeViewModel(
     private val services: LightiousServices,
+    private val resumeInterruptedDownload: suspend (DownloadedMedia) -> Boolean,
 ) : LightViewModel<Unit>() {
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
@@ -80,6 +104,11 @@ class HomeViewModel(
     private var editorSession = 0
 
     init {
+        viewModelScope.launch(Dispatchers.IO) {
+            services.downloads.observeAll().collect { downloads ->
+                _uiState.update { state -> state.copy(downloads = downloads) }
+            }
+        }
         reload()
     }
 
@@ -117,6 +146,15 @@ class HomeViewModel(
             } catch (_: Exception) {
                 CompanionState()
             }
+            _uiState.update { current ->
+                current.copy(
+                    settings = settings,
+                    account = account,
+                    companion = cachedCompanion.copy(profile = null),
+                    mode = HomeMode.Ready,
+                    errorMessage = null,
+                )
+            }
             var companion = cachedCompanion
             var syncError: String? = null
             if (cachedCompanion.session != null) {
@@ -126,18 +164,38 @@ class HomeViewModel(
                         // A paired Home must not display a stale Focused library.
                         // Playback also revalidates, but visibility is part of the
                         // companion contract rather than a security boundary.
-                        companion = cachedCompanion.copy(profile = null)
+                        companion = try {
+                            services.companion.load(settings.instanceUrl).copy(profile = null)
+                        } catch (loadError: CancellationException) {
+                            throw loadError
+                        } catch (_: Exception) {
+                            CompanionState()
+                        }
                         syncError = error.userMessage("Could not sync the companion.")
                     },
                 )
             }
-            _uiState.value = HomeUiState(
-                settings = settings,
-                account = account,
-                companion = companion,
-                mode = HomeMode.Ready,
-                errorMessage = syncError,
-            )
+            _uiState.update { current ->
+                current.copy(
+                    settings = settings,
+                    account = account,
+                    companion = companion,
+                    mode = HomeMode.Ready,
+                    errorMessage = syncError,
+                )
+            }
+            companion.session?.deviceId?.let { ownerDeviceId ->
+                services.downloads.recoverInterruptedDownloads(ownerDeviceId).forEach { download ->
+                    if (!resumeInterruptedDownload(download)) {
+                        services.downloads.markFailed(
+                            ownerDeviceId,
+                            download.videoId,
+                            "The background download service is unavailable.",
+                            download.kind,
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -155,12 +213,24 @@ class HomeViewModel(
             it.copy(mode = HomeMode.Loading("Checking server…"), errorMessage = null)
         }
         requestJob = viewModelScope.launch(Dispatchers.IO) {
-            val probe = InvidiousApi(
-                normalized,
-                _uiState.value.settings.proxyMedia,
-                _uiState.value.settings.audioLanguage,
-            ).use { api ->
-                api.probe()
+            val currentSettings = _uiState.value.settings
+            val probe = if (currentSettings.instanceUrl == normalized) {
+                services.companion.probeSavedInstance(
+                    instanceUrl = normalized,
+                    proxyMedia = currentSettings.proxyMedia,
+                    audioLanguage = currentSettings.audioLanguage,
+                ).getOrElse { error ->
+                    showInstanceEditor(normalized, error.userMessage("Could not verify companion access."))
+                    return@launch
+                }
+            } else {
+                InvidiousApi(
+                    baseUrl = normalized,
+                    proxyMedia = currentSettings.proxyMedia,
+                    audioLanguage = currentSettings.audioLanguage,
+                ).use { api ->
+                    api.probe()
+                }
             }
             if (!probe.apiAvailable) {
                 showInstanceEditor(normalized, probe.message)
@@ -182,6 +252,14 @@ class HomeViewModel(
         _uiState.update { it.copy(errorMessage = null) }
     }
 
+    fun selectFocusedTab(tab: FocusedHomeTab) {
+        _uiState.update { state -> state.copy(focusedTab = tab) }
+    }
+
+    fun selectFocusedFilter(filter: FocusedLibraryFilter) {
+        _uiState.update { state -> state.copy(focusedFilter = filter) }
+    }
+
     private fun showInstanceEditor(initialValue: String, error: String? = null) {
         editorSession += 1
         _uiState.update {
@@ -200,7 +278,27 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
 
     override val viewModelClass = HomeViewModel::class.java
 
-    override fun createViewModel() = HomeViewModel(services)
+    override fun createViewModel() = HomeViewModel(
+        services = services,
+        resumeInterruptedDownload = { download ->
+            when (
+                LightWork.getState(
+                    lightContext,
+                    downloadJobTag(download.ownerDeviceId, download.videoId, download.kind),
+                )
+            ) {
+                LightJobState.Enqueued,
+                LightJobState.Running,
+                -> true
+                else -> enqueueDownload(
+                    lightContext,
+                    download.ownerDeviceId,
+                    download.videoId,
+                    download.kind,
+                )
+            }
+        },
+    )
 
     override fun willShow() {
         viewModel.reload()
@@ -211,6 +309,10 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
         val colors by LightThemeController.colors.collectAsState()
         val state by viewModel.uiState.collectAsState()
         val companionProfile = state.companion.profile
+        val experienceMode = companionProfile.effectiveExperienceMode()
+        val pairedDownloads = state.companion.session?.deviceId?.let { ownerDeviceId ->
+            state.downloads.filter { download -> download.ownerDeviceId == ownerDeviceId }
+        }.orEmpty()
 
         LightTheme(colors = colors) {
             Box(
@@ -221,14 +323,22 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                 when (val mode = state.mode) {
                     is HomeMode.Loading -> LoadingContent(mode.message)
                     HomeMode.Ready -> when {
-                        companionProfile?.mode == ExperienceMode.FOCUSED -> FocusedHomeContent(
-                            videos = companionProfile.items,
+                        experienceMode == ExperienceMode.FOCUSED -> FocusedHomeContent(
+                            profile = companionProfile,
+                            downloads = pairedDownloads,
+                            paired = state.companion.session != null,
+                            selectedTab = state.focusedTab,
+                            selectedFilter = state.focusedFilter,
                             onVideo = ::openFocusedVideo,
+                            onChannel = ::openFocusedChannel,
+                            onPlaylist = ::openFocusedPlaylist,
+                            onDownload = ::openDownload,
+                            onTab = viewModel::selectFocusedTab,
+                            onFilter = viewModel::selectFocusedFilter,
+                            onSearch = { openFocusedSearch(companionProfile, pairedDownloads) },
                             onRefresh = viewModel::reload,
                             onSettings = ::openSettings,
                         )
-                        state.companion.session != null && state.companion.profile == null ->
-                            CompanionUnavailableContent(onRefresh = viewModel::reload, onSettings = ::openSettings)
                         else -> HomeMenuContent(
                             settings = state.settings,
                             signedIn = state.account != null,
@@ -278,46 +388,151 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
             },
         )
     }
+
+    private fun openFocusedChannel(channel: FocusedChannelEntry) {
+        navigateTo(
+            screenFactory = { activity ->
+                FocusedChannelScreen(activity, services, viewModel.uiState.value.settings, channel)
+            },
+        )
+    }
+
+    private fun openFocusedPlaylist(playlist: FocusedPlaylistEntry) {
+        navigateTo(
+            screenFactory = { activity ->
+                FocusedPlaylistScreen(activity, services, viewModel.uiState.value.settings, playlist)
+            },
+        )
+    }
+
+    private fun openDownload(download: DownloadedMedia) {
+        navigateTo(
+            screenFactory = { activity ->
+                DownloadedMediaScreen(activity, services, download.ownerDeviceId, download.videoId)
+            },
+        )
+    }
+
+    private fun openFocusedSearch(profile: CompanionProfile?, downloads: List<DownloadedMedia>) {
+        navigateTo(
+            screenFactory = { activity ->
+                FocusedLibrarySearchScreen(
+                    activity,
+                    services,
+                    viewModel.uiState.value.settings,
+                    profile,
+                    downloads,
+                )
+            },
+        )
+    }
 }
 
 @Composable
 private fun FocusedHomeContent(
-    videos: List<CuratedVideo>,
+    profile: CompanionProfile?,
+    downloads: List<DownloadedMedia>,
+    paired: Boolean,
+    selectedTab: FocusedHomeTab,
+    selectedFilter: FocusedLibraryFilter,
     onVideo: (CuratedVideo) -> Unit,
+    onChannel: (FocusedChannelEntry) -> Unit,
+    onPlaylist: (FocusedPlaylistEntry) -> Unit,
+    onDownload: (DownloadedMedia) -> Unit,
+    onTab: (FocusedHomeTab) -> Unit,
+    onFilter: (FocusedLibraryFilter) -> Unit,
+    onSearch: () -> Unit,
     onRefresh: () -> Unit,
     onSettings: () -> Unit,
 ) {
+    val channels = profile?.focusedChannels().orEmpty().filter { channel -> channel.includes(selectedFilter) }
+    val playlists = profile?.focusedPlaylists().orEmpty().filter { playlist -> playlist.includes(selectedFilter) }
+    val videos = profile?.items.orEmpty().filter { video -> selectedFilter.includes(video.playbackPolicy) }
     Column(modifier = Modifier.fillMaxSize()) {
         LightTopBar(
-            center = LightTopBarCenter.Text("Focused"),
+            leftButton = LightBarButton.LightIcon(
+                icon = LightIcons.SEARCH,
+                onClick = onSearch,
+                contentDescription = "Search library",
+            ),
+            center = LightTopBarCenter.Text(selectedTab.focusedTitle()),
             rightButton = LightBarButton.LightIcon(
                 icon = LightIcons.SETTINGS,
                 onClick = onSettings,
                 contentDescription = "Settings",
             ),
         )
+        if (selectedTab != FocusedHomeTab.DOWNLOADS && profile != null) {
+            FocusedFilterRow(selectedFilter = selectedFilter, onFilter = onFilter)
+        }
         LightScrollView(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 1f.gridUnitsAsDp()),
         ) {
-            if (videos.isEmpty()) {
-                LightText(
-                    text = "Your Focused library is empty. Send a video from the Lightious companion website.",
-                    variant = LightTextVariant.Copy,
-                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+            if (profile == null && selectedTab != FocusedHomeTab.DOWNLOADS) {
+                FocusedEmptyMessage(
+                    if (paired) {
+                        "Sync is required before this paired phone can open its library."
+                    } else {
+                        "Pair this phone in Settings to load your Focused library."
+                    },
                 )
-            } else {
-                videos.forEach { video -> VideoRow(video.asVideoSummary()) { onVideo(video) } }
+                if (paired) {
+                    LightText(
+                        text = "RETRY SYNC",
+                        variant = LightTextVariant.Button,
+                        underline = true,
+                        modifier = Modifier
+                            .padding(top = 1f.gridUnitsAsDp())
+                            .lightClickable(onClick = onRefresh),
+                    )
+                }
+            } else when (selectedTab) {
+                FocusedHomeTab.VIDEOS -> if (videos.isEmpty()) {
+                    FocusedEmptyMessage("No videos match this filter. Send a video from the companion website.")
+                } else {
+                    videos.forEach { video -> VideoRow(video.asVideoSummary()) { onVideo(video) } }
+                }
+                FocusedHomeTab.CHANNELS -> if (channels.isEmpty()) {
+                    FocusedEmptyMessage("No channels match this filter. Add a channel from the companion website.")
+                } else {
+                    channels.forEach { channel -> ChannelRow(channel) { onChannel(channel) } }
+                }
+                FocusedHomeTab.PLAYLISTS -> if (playlists.isEmpty()) {
+                    FocusedEmptyMessage("No playlists match this filter. Build one from videos in the companion website.")
+                } else {
+                    playlists.forEach { playlist -> PlaylistRow(playlist) { onPlaylist(playlist) } }
+                }
+                FocusedHomeTab.DOWNLOADS -> if (downloads.isEmpty()) {
+                    FocusedEmptyMessage("No downloads yet. Open a video in your library to save it offline.")
+                } else {
+                    downloads.forEach { download -> DownloadRow(download) { onDownload(download) } }
+                }
             }
         }
         LightBottomBar(
             items = listOf(
                 LightBarButton.LightIcon(
-                    icon = LightIcons.REFRESH,
-                    onClick = onRefresh,
-                    contentDescription = "Sync",
+                    icon = LightIcons.MEDIA,
+                    onClick = { onTab(FocusedHomeTab.VIDEOS) },
+                    contentDescription = "Videos",
+                ),
+                LightBarButton.LightIcon(
+                    icon = LightIcons.CONTACTS,
+                    onClick = { onTab(FocusedHomeTab.CHANNELS) },
+                    contentDescription = "Channels",
+                ),
+                LightBarButton.LightIcon(
+                    icon = LightIcons.LIST,
+                    onClick = { onTab(FocusedHomeTab.PLAYLISTS) },
+                    contentDescription = "Playlists",
+                ),
+                LightBarButton.LightIcon(
+                    icon = LightIcons.DOWNLOAD_ARROW,
+                    onClick = { onTab(FocusedHomeTab.DOWNLOADS) },
+                    contentDescription = "Downloads",
                 ),
             ),
         )
@@ -325,42 +540,50 @@ private fun FocusedHomeContent(
 }
 
 @Composable
-private fun CompanionUnavailableContent(
-    onRefresh: () -> Unit,
-    onSettings: () -> Unit,
+internal fun FocusedFilterRow(
+    selectedFilter: FocusedLibraryFilter,
+    onFilter: (FocusedLibraryFilter) -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxSize()) {
-        LightTopBar(
-            center = LightTopBarCenter.Text("Lightious"),
-            rightButton = LightBarButton.LightIcon(
-                icon = LightIcons.SETTINGS,
-                onClick = onSettings,
-                contentDescription = "Settings",
-            ),
-        )
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .padding(horizontal = 1f.gridUnitsAsDp()),
-            contentAlignment = Alignment.Center,
-        ) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 1f.gridUnitsAsDp()),
+    ) {
+        FocusedLibraryFilter.entries.forEach { filter ->
             LightText(
-                text = "Sync is required before this paired phone can open videos.",
-                variant = LightTextVariant.Copy,
+                text = filter.filterLabel(),
+                variant = LightTextVariant.Button,
+                underline = filter == selectedFilter,
                 align = TextAlign.Center,
+                modifier = Modifier
+                    .weight(1f)
+                    .lightClickable(onClick = { onFilter(filter) })
+                    .padding(vertical = 0.45f.gridUnitsAsDp()),
             )
         }
-        LightBottomBar(
-            items = listOf(
-                LightBarButton.LightIcon(
-                    icon = LightIcons.REFRESH,
-                    onClick = onRefresh,
-                    contentDescription = "Sync",
-                ),
-            ),
-        )
     }
+}
+
+@Composable
+private fun FocusedEmptyMessage(message: String) {
+    LightText(
+        text = message,
+        variant = LightTextVariant.Copy,
+        modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+    )
+}
+
+internal fun FocusedLibraryFilter.filterLabel(): String = when (this) {
+    FocusedLibraryFilter.ALL -> "ALL"
+    FocusedLibraryFilter.LISTEN -> "AUDIO"
+    FocusedLibraryFilter.WATCH -> "VIDEO"
+}
+
+private fun FocusedHomeTab.focusedTitle(): String = when (this) {
+    FocusedHomeTab.VIDEOS -> "Videos"
+    FocusedHomeTab.CHANNELS -> "Channels"
+    FocusedHomeTab.PLAYLISTS -> "Playlists"
+    FocusedHomeTab.DOWNLOADS -> "Downloads"
 }
 
 @Composable

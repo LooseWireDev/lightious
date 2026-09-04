@@ -4,6 +4,7 @@ import java.net.URI
 import java.net.URLDecoder
 
 private val VIDEO_ID = Regex("^[A-Za-z0-9_-]{11}$")
+private val CHANNEL_ID = Regex("^UC[A-Za-z0-9_-]{22}$")
 private val EXPLICIT_SCHEME = Regex("^[A-Za-z][A-Za-z0-9+.-]*://")
 
 fun normalizeInstanceUrl(value: String): String {
@@ -44,33 +45,51 @@ fun normalizeInstanceUrl(value: String): String {
 }
 
 fun extractYouTubeVideoId(value: String): String? {
+    val reference = parseYouTubeVideoReference(value) ?: return null
+    return reference.videoId.takeUnless { reference.isShort }
+}
+
+internal fun isYouTubeShortsUrl(value: String): Boolean =
+    parseYouTubeVideoReference(value)?.isShort == true
+
+private fun parseYouTubeVideoReference(value: String): YouTubeVideoReference? {
     val input = value.trim()
-    if (VIDEO_ID.matches(input)) return input
+    if (VIDEO_ID.matches(input)) return YouTubeVideoReference(input, isShort = false)
     if (input.isEmpty()) return null
 
     val candidateUrl = if (EXPLICIT_SCHEME.containsMatchIn(input)) input else "https://$input"
     val uri = runCatching { URI(candidateUrl) }.getOrNull() ?: return null
     val host = uri.host?.lowercase()?.removePrefix("www.") ?: return null
 
-    val candidate = when {
-        host == "youtu.be" -> uri.rawPath.pathSegments().firstOrNull()
+    val (candidate, isShort) = when {
+        host == "youtu.be" -> uri.rawPath.pathSegments().firstOrNull() to false
         host == "youtube.com" || host.endsWith(".youtube.com") -> {
             val segments = uri.rawPath.pathSegments()
             when (segments.firstOrNull()?.lowercase()) {
-                "watch" -> uri.rawQuery.queryParameter("v")
-                "shorts", "embed", "live", "v" -> segments.getOrNull(1)
-                else -> null
+                "watch" -> uri.rawQuery.queryParameter("v") to false
+                "shorts" -> segments.getOrNull(1) to true
+                "embed", "live", "v" -> segments.getOrNull(1) to false
+                else -> null to false
             }
         }
         host == "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com") -> {
             val segments = uri.rawPath.pathSegments()
-            if (segments.firstOrNull()?.lowercase() == "embed") segments.getOrNull(1) else null
+            (if (segments.firstOrNull()?.lowercase() == "embed") segments.getOrNull(1) else null) to false
         }
-        else -> null
+        else -> null to false
     }
 
-    return candidate?.takeIf(VIDEO_ID::matches)
+    return candidate
+        ?.takeIf(VIDEO_ID::matches)
+        ?.let { videoId -> YouTubeVideoReference(videoId, isShort) }
 }
+
+private data class YouTubeVideoReference(
+    val videoId: String,
+    val isShort: Boolean,
+)
+
+internal fun validYouTubeChannelId(value: String): Boolean = CHANNEL_ID.matches(value)
 
 internal fun resolveMediaUrl(value: String?, instanceUrl: String): String? {
     val raw = value?.trim()?.takeIf(String::isNotEmpty) ?: return null

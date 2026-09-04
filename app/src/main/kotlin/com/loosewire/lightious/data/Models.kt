@@ -27,6 +27,8 @@ val DEFAULT_HOME_PAGES: List<HomePage> = listOf(
 
 data class ClientSettings(
     val instanceUrl: String = DEFAULT_INVIDIOUS_INSTANCE_URL,
+    val selfHostEnabled: Boolean = DEFAULT_INVIDIOUS_INSTANCE_URL.isBlank(),
+    val managedServerAvailable: Boolean = DEFAULT_INVIDIOUS_INSTANCE_URL.isNotBlank(),
     val proxyMedia: Boolean = true,
     val homePages: List<HomePage> = DEFAULT_HOME_PAGES,
     val saveSearchHistory: Boolean = true,
@@ -62,6 +64,13 @@ data class VideoSummary(
     val publishedText: String,
     val liveNow: Boolean,
     val thumbnailUrl: String? = null,
+    val authorId: String? = null,
+    val isShort: Boolean = false,
+)
+
+data class ChannelVideosPage(
+    val videos: List<VideoSummary>,
+    val continuation: String? = null,
 )
 
 data class SearchHistoryEntry(
@@ -208,18 +217,22 @@ internal data class InvidiousVideoItemDto(
     val videoId: String? = null,
     val title: String? = null,
     val author: String? = null,
+    val authorId: String? = null,
     val lengthSeconds: JsonElement? = null,
     val viewCount: JsonElement? = null,
     val publishedText: String? = null,
     val liveNow: JsonElement? = null,
     val videoThumbnails: List<InvidiousThumbnailDto>? = null,
+    val isShort: JsonElement? = null,
 )
 
 @Serializable
 internal data class InvidiousVideoDto(
+    val type: String? = null,
     val videoId: String? = null,
     val title: String? = null,
     val author: String? = null,
+    val authorId: String? = null,
     val lengthSeconds: JsonElement? = null,
     val viewCount: JsonElement? = null,
     val publishedText: String? = null,
@@ -230,12 +243,29 @@ internal data class InvidiousVideoDto(
     val adaptiveFormats: List<InvidiousFormatDto>? = null,
     val hlsUrl: String? = null,
     val dashUrl: String? = null,
+    val isShort: JsonElement? = null,
 )
 
 @Serializable
 internal data class InvidiousFeedDto(
     val notifications: List<InvidiousVideoItemDto>? = null,
     val videos: List<InvidiousVideoItemDto>? = null,
+)
+
+@Serializable
+internal data class InvidiousStatsDto(
+    val software: InvidiousSoftwareDto? = null,
+)
+
+@Serializable
+internal data class InvidiousSoftwareDto(
+    val name: String? = null,
+)
+
+@Serializable
+internal data class InvidiousChannelVideosDto(
+    val videos: List<InvidiousVideoItemDto> = emptyList(),
+    val continuation: String? = null,
 )
 
 @Serializable

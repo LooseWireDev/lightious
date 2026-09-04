@@ -20,11 +20,14 @@ class InvidiousApiTest {
                     """
                     [
                       {"type":"channel","author":"Channel"},
+                      {"type":"shortVideo","videoId":"aqz-KE-bpKQ","title":"A Short"},
+                      {"type":"video","videoId":"m8KnrXli-bA","title":"Flagged Short","isShort":true},
                       {
                         "type":"video",
                         "videoId":"dQw4w9WgXcQ",
                         "title":"A video",
                         "author":"An author",
+                        "authorId":"$CHANNEL_ID",
                         "lengthSeconds":"213",
                         "viewCount":1234,
                         "publishedText":"2 days ago",
@@ -43,8 +46,93 @@ class InvidiousApiTest {
         assertEquals(213, videos.single().lengthSeconds)
         assertEquals(1234, videos.single().viewCount)
         assertFalse(videos.single().liveNow)
+        assertEquals(CHANNEL_ID, videos.single().authorId)
         assertEquals("video", transport.requests.single().parameters["type"])
         assertTrue(transport.requests.single().headers.isEmpty())
+        api.close()
+    }
+
+    @Test
+    fun `channel videos map author ids and continuation pages`() = runTest {
+        val transport = FakeTransport(
+            getResponse = { url, parameters ->
+                check(url.endsWith("/api/v1/channels/$CHANNEL_ID/videos"))
+                assertEquals("newest", parameters["sort_by"])
+                assertEquals("next-page", parameters["continuation"])
+                InvidiousHttpResponse(
+                    200,
+                    """
+                    {
+                      "videos":[{
+                        "type":"video",
+                        "videoId":"dQw4w9WgXcQ",
+                        "title":"A channel video",
+                        "author":"A channel",
+                        "authorId":"$CHANNEL_ID"
+                      },{
+                        "type":"shortVideo",
+                        "videoId":"aqz-KE-bpKQ",
+                        "title":"A Short",
+                        "authorId":"$CHANNEL_ID"
+                      },{
+                        "type":"video",
+                        "videoId":"m8KnrXli-bA",
+                        "title":"A flagged Short",
+                        "authorId":"$CHANNEL_ID",
+                        "isShort":true
+                      }],
+                      "continuation":"page-three"
+                    }
+                    """.trimIndent(),
+                )
+            },
+        )
+        val api = InvidiousApi("https://invidious.example", transport = transport)
+
+        val page = api.channelVideos(CHANNEL_ID, "next-page").getOrThrow()
+
+        assertEquals(listOf("dQw4w9WgXcQ"), page.videos.map(VideoSummary::videoId))
+        assertEquals(CHANNEL_ID, page.videos.single().authorId)
+        assertEquals("page-three", page.continuation)
+        api.close()
+    }
+
+    @Test
+    fun `channel videos reject non-canonical id without a request`() = runTest {
+        val transport = FakeTransport(getResponse = { url, _ -> error("Unexpected GET: $url") })
+        val api = InvidiousApi("https://invidious.example", transport = transport)
+
+        assertTrue(api.channelVideos("not-a-channel").isFailure)
+        assertTrue(transport.requests.isEmpty())
+        api.close()
+    }
+
+    @Test
+    fun `Shorts URLs are ignored without requesting search or video details`() = runTest {
+        val transport = FakeTransport(getResponse = { url, _ -> error("Unexpected GET: $url") })
+        val api = InvidiousApi("https://invidious.example", transport = transport)
+        val shortsUrl = "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+
+        assertTrue(api.search(shortsUrl).getOrThrow().isEmpty())
+        assertTrue(api.video(shortsUrl).isFailure)
+        assertTrue(transport.requests.isEmpty())
+        api.close()
+    }
+
+    @Test
+    fun `video details reject an explicitly flagged Short`() = runTest {
+        val transport = FakeTransport(getResponse = { _, _ ->
+            InvidiousHttpResponse(
+                200,
+                """{"videoId":"dQw4w9WgXcQ","title":"A Short","isShort":true}""",
+            )
+        })
+        val api = InvidiousApi("https://invidious.example", transport = transport)
+
+        val result = api.video("dQw4w9WgXcQ")
+
+        assertTrue(result.isFailure)
+        assertEquals(SHORTS_BLOCKED_MESSAGE, result.exceptionOrNull()?.message)
         api.close()
     }
 
@@ -77,6 +165,64 @@ class InvidiousApiTest {
 
         assertEquals(listOf("dQw4w9WgXcQ", "aqz-KE-bpKQ"), videos.map(VideoSummary::videoId))
         assertEquals("Bearer $AUTH_TOKEN", transport.requests.single().headers["Authorization"])
+        api.close()
+    }
+
+    @Test
+    fun `paired content routes use device bearer and lightious api paths`() = runTest {
+        val transport = FakeTransport(
+            getResponse = { url, parameters ->
+                when {
+                    url.endsWith("/api/lightious/v1/popular") -> InvidiousHttpResponse(200, "[]")
+                    url.endsWith("/api/lightious/v1/search") -> {
+                        assertEquals("kittens", parameters["q"])
+                        InvidiousHttpResponse(200, "[]")
+                    }
+                    url.endsWith("/api/lightious/v1/feed") -> InvidiousHttpResponse(
+                        200,
+                        """{"videos":[{"type":"video","videoId":"dQw4w9WgXcQ","title":"A video"}]}""",
+                    )
+                    url.endsWith("/api/lightious/v1/history") -> InvidiousHttpResponse(
+                        200,
+                        """["dQw4w9WgXcQ"]""",
+                    )
+                    url.endsWith("/api/lightious/v1/channels/$CHANNEL_ID/videos") ->
+                        InvidiousHttpResponse(
+                            200,
+                            """{"videos":[{"type":"video","videoId":"dQw4w9WgXcQ","title":"A video","authorId":"$CHANNEL_ID"}]}""",
+                        )
+                    url.endsWith("/api/lightious/v1/videos/dQw4w9WgXcQ") ->
+                        InvidiousHttpResponse(200, VIDEO_DETAILS_JSON)
+                    else -> error("Unexpected URL: $url")
+                }
+            },
+            postResponse = { url, _ ->
+                check(url.endsWith("/api/lightious/v1/history/dQw4w9WgXcQ"))
+                InvidiousHttpResponse(204, "")
+            },
+        )
+        val api = InvidiousApi(
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            deviceBearer = DEVICE_BEARER,
+            transport = transport,
+        )
+
+        api.popular().getOrThrow()
+        api.search("kittens").getOrThrow()
+        api.accountFeed("").getOrThrow()
+        api.accountHistoryIds("", maxResults = 5).getOrThrow()
+        api.channelVideos(CHANNEL_ID).getOrThrow()
+        api.video("dQw4w9WgXcQ").getOrThrow()
+        api.markWatched("", "dQw4w9WgXcQ").getOrThrow()
+
+        assertTrue(transport.requests.all { request -> request.url.contains("/api/lightious/v1/") })
+        assertTrue(transport.requests.all { request -> request.headers["Authorization"] == "Bearer $DEVICE_BEARER" })
+        assertEquals(
+            emptyMap(),
+            transport.requests.first { request -> request.url.endsWith("/api/lightious/v1/videos/dQw4w9WgXcQ") }.parameters,
+        )
+        assertEquals("Bearer $DEVICE_BEARER", transport.postRequests.single().headers["Authorization"])
         api.close()
     }
 
@@ -162,6 +308,7 @@ class InvidiousApiTest {
         assertEquals("https://invidious.example/videoplayback?itag=140", details.audioUrl)
         assertEquals(720, details.selection.progressive?.height)
         assertEquals(128_000, details.selection.adaptiveAudio?.bitrate)
+        assertEquals(CHANNEL_ID, details.summary.authorId)
         api.close()
     }
 
@@ -184,16 +331,55 @@ class InvidiousApiTest {
     }
 
     @Test
-    fun `probe checks one byte of a selected playback URL`() = runTest {
+    fun `probe validates public stats without touching protected content`() = runTest {
+        val transport = FakeTransport(
+            getResponse = { url, _ ->
+                check(url.endsWith("/api/v1/stats"))
+                InvidiousHttpResponse(
+                    200,
+                    """{"software":{"name":"invidious","version":"test","branch":"lightious"}}""",
+                )
+            },
+        )
+        val api = InvidiousApi("https://invidious.example", proxyMedia = true, transport = transport)
+
+        val probe = api.probe()
+
+        assertTrue(probe.reachable)
+        assertTrue(probe.apiAvailable)
+        assertFalse(probe.playbackAvailable)
+        assertEquals(200, probe.apiStatusCode)
+        assertTrue(transport.requests.single().parameters.isEmpty())
+        assertTrue(transport.requests.single().headers.isEmpty())
+        assertTrue(transport.byteRequests.isEmpty())
+        api.close()
+    }
+
+    @Test
+    fun `probe rejects a successful response that is not Invidious stats`() = runTest {
+        val api = InvidiousApi(
+            baseUrl = "https://example.com",
+            transport = FakeTransport(
+                getResponse = { _, _ -> InvidiousHttpResponse(200, """{"status":"ok"}""") },
+            ),
+        )
+
+        val probe = api.probe()
+
+        assertTrue(probe.reachable)
+        assertFalse(probe.apiAvailable)
+        assertEquals("The server did not identify itself as Invidious.", probe.message)
+        api.close()
+    }
+
+    @Test
+    fun `paired probe uses authenticated video and media routes without public fallback`() = runTest {
         val transport = FakeTransport(
             getResponse = { url, _ ->
                 when {
-                    url.endsWith("/api/v1/search") -> InvidiousHttpResponse(
-                        200,
-                        """[{"type":"video","videoId":"dQw4w9WgXcQ","title":"Probe"}]""",
-                    )
-                    url.endsWith("/api/v1/videos/dQw4w9WgXcQ") ->
+                    url.endsWith("/api/lightious/v1/videos/dQw4w9WgXcQ") ->
                         InvidiousHttpResponse(200, VIDEO_DETAILS_JSON)
+                    url.contains("/api/v1/") -> error("Unexpected public fallback: $url")
                     else -> error("Unexpected URL: $url")
                 }
             },
@@ -203,30 +389,52 @@ class InvidiousApiTest {
                 rangeSupported = true,
             ),
         )
-        val api = InvidiousApi("https://invidious.example", proxyMedia = true, transport = transport)
+        val api = InvidiousApi(
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            deviceBearer = DEVICE_BEARER,
+            transport = transport,
+        )
 
-        val probe = api.probe()
+        val probe = api.probeAuthorized("dQw4w9WgXcQ")
 
         assertTrue(probe.successful)
-        assertTrue(probe.rangeSupported)
-        assertEquals(206, probe.playbackStatusCode)
-        assertEquals("Light", transport.requests.first().parameters["q"])
-        assertEquals("video", transport.requests.first().parameters["type"])
-        assertEquals("https://invidious.example/videoplayback?itag=22", transport.byteRequests.single())
+        assertTrue(transport.requests.all { request -> request.url.contains("/api/lightious/v1/") })
+        assertTrue(transport.requests.all { request -> request.headers["Authorization"] == "Bearer $DEVICE_BEARER" })
+        api.close()
+    }
+
+    @Test
+    fun `paired probe can confirm authenticated connectivity without probing search`() = runTest {
+        val transport = FakeTransport(
+            getResponse = { url, _ -> error("Unexpected authenticated GET: $url") },
+        )
+        val api = InvidiousApi(
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            deviceBearer = DEVICE_BEARER,
+            transport = transport,
+        )
+
+        val probe = api.probeAuthorized()
+
+        assertTrue(probe.apiAvailable)
+        assertTrue(!probe.playbackAvailable)
+        assertTrue(transport.requests.isEmpty())
         api.close()
     }
 
     @Test
     fun `probe distinguishes an HTTP API failure from network failure`() = runTest {
         val httpApi = InvidiousApi(
-            "https://invidious.example",
-            true,
-            FakeTransport(getResponse = { _, _ -> InvidiousHttpResponse(503, "unavailable") }),
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            transport = FakeTransport(getResponse = { _, _ -> InvidiousHttpResponse(503, "unavailable") }),
         )
         val networkApi = InvidiousApi(
-            "https://offline.example",
-            true,
-            FakeTransport(getResponse = { _, _ -> throw IllegalStateException("offline") }),
+            baseUrl = "https://offline.example",
+            proxyMedia = true,
+            transport = FakeTransport(getResponse = { _, _ -> throw IllegalStateException("offline") }),
         )
 
         val httpProbe = httpApi.probe()
@@ -244,14 +452,14 @@ class InvidiousApiTest {
     @Test
     fun `search and probe propagate coroutine cancellation`() = runTest {
         val searchApi = InvidiousApi(
-            "https://invidious.example",
-            true,
-            FakeTransport(getResponse = { _, _ -> throw CancellationException("leave search") }),
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            transport = FakeTransport(getResponse = { _, _ -> throw CancellationException("leave search") }),
         )
         val probeApi = InvidiousApi(
-            "https://invidious.example",
-            true,
-            FakeTransport(getResponse = { _, _ -> throw CancellationException("leave setup") }),
+            baseUrl = "https://invidious.example",
+            proxyMedia = true,
+            transport = FakeTransport(getResponse = { _, _ -> throw CancellationException("leave setup") }),
         )
 
         assertFailsWith<CancellationException> { searchApi.search("test") }
@@ -309,12 +517,15 @@ class InvidiousApiTest {
     private companion object {
         const val AUTH_TOKEN =
             "{\"session\":\"v1:test-session\",\"scopes\":[\"GET:feed\",\"GET:history\",\"POST:history/*\"],\"signature\":\"test-signature\"}"
+        const val CHANNEL_ID = "UCXuqSBlHAE6Xw-yeJA0Tunw"
+        const val DEVICE_BEARER = "lpt_device_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
         val VIDEO_DETAILS_JSON = """
             {
               "videoId":"dQw4w9WgXcQ",
               "title":"A video",
               "author":"An author",
+              "authorId":"$CHANNEL_ID",
               "lengthSeconds":213,
               "viewCount":"1234",
               "publishedText":"2 days ago",

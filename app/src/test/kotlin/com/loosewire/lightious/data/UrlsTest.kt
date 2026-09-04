@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class UrlsTest {
     @Test
@@ -38,7 +39,6 @@ class UrlsTest {
             "https://www.youtube.com/watch?feature=share&v=$id&t=12",
             "music.youtube.com/watch?v=$id",
             "https://youtu.be/$id?si=abc",
-            "youtube.com/shorts/$id",
             "https://www.youtube.com/embed/$id",
             "https://youtube.com/live/$id?feature=share",
             "https://www.youtube-nocookie.com/embed/$id",
@@ -47,6 +47,14 @@ class UrlsTest {
         inputs.forEach { input ->
             assertEquals(id, extractYouTubeVideoId(input), input)
         }
+    }
+
+    @Test
+    fun `rejects YouTube Shorts URLs while preserving their classification`() {
+        val url = "youtube.com/shorts/dQw4w9WgXcQ?feature=share"
+
+        assertNull(extractYouTubeVideoId(url))
+        assertTrue(isYouTubeShortsUrl(url))
     }
 
     @Test

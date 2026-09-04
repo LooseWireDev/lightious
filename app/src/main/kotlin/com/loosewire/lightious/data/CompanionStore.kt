@@ -33,6 +33,7 @@ class CompanionStore internal constructor(
                 null
             }
         }?.takeIf { cached -> session != null && cached.deviceId == session.deviceId }
+            ?.withoutShorts()
         return CompanionState(session, profile)
     }
 
@@ -54,7 +55,7 @@ class CompanionStore internal constructor(
         dataStore.edit { preferences ->
             if (preferences[INSTANCE_URL] == normalizedInstance && preferences[DEVICE_ID] == profile.deviceId) {
                 preferences[ACCOUNT] = profile.account
-                preferences[CACHED_PROFILE] = json.encodeToString(profile)
+                preferences[CACHED_PROFILE] = json.encodeToString(profile.withoutShorts())
             }
         }
     }
@@ -66,6 +67,25 @@ class CompanionStore internal constructor(
             preferences.remove(ACCOUNT)
             preferences.remove(ENCRYPTED_BEARER)
             preferences.remove(CACHED_PROFILE)
+        }
+    }
+
+    suspend fun clearIfMatches(
+        expectedInstanceUrl: String,
+        expectedDeviceId: String,
+    ) {
+        val normalizedInstance = normalizeInstanceUrl(expectedInstanceUrl)
+        dataStore.edit { preferences ->
+            if (
+                preferences[INSTANCE_URL] == normalizedInstance &&
+                preferences[DEVICE_ID] == expectedDeviceId
+            ) {
+                preferences.remove(INSTANCE_URL)
+                preferences.remove(DEVICE_ID)
+                preferences.remove(ACCOUNT)
+                preferences.remove(ENCRYPTED_BEARER)
+                preferences.remove(CACHED_PROFILE)
+            }
         }
     }
 

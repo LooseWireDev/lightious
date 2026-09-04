@@ -18,6 +18,7 @@ import com.loosewire.lightious.data.CompanionState
 import com.loosewire.lightious.data.ExperienceMode
 import com.loosewire.lightious.data.PairingStatus
 import com.loosewire.lightious.data.PendingPairing
+import com.loosewire.lightious.data.pairedHistoryAccountKey
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -77,7 +78,13 @@ class CompanionViewModel(
                     services.companion.sync(settings.instanceUrl).fold(
                         onSuccess = { profile -> companion = companion.copy(profile = profile) },
                         onFailure = { error ->
-                            companion = companion.copy(profile = null)
+                            companion = try {
+                                services.companion.load(settings.instanceUrl).copy(profile = null)
+                            } catch (loadError: CancellationException) {
+                                throw loadError
+                            } catch (_: Exception) {
+                                CompanionState()
+                            }
                             syncError = error.userMessage("Could not sync the companion.")
                         },
                     )
@@ -173,9 +180,16 @@ class CompanionViewModel(
                     }
                 },
                 onFailure = { error ->
+                    val companion = try {
+                        services.companion.load(_uiState.value.instanceUrl).copy(profile = null)
+                    } catch (loadError: CancellationException) {
+                        throw loadError
+                    } catch (_: Exception) {
+                        CompanionState()
+                    }
                     _uiState.update {
                         it.copy(
-                            companion = it.companion.copy(profile = null),
+                            companion = companion,
                             loading = false,
                             errorMessage = error.userMessage("Could not sync the companion."),
                         )
@@ -190,7 +204,12 @@ class CompanionViewModel(
         pollJob?.cancel()
         requestJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                services.companion.forget()
+                _uiState.value.companion.session?.let { session ->
+                    services.history.clearPendingServerWatches(
+                        pairedHistoryAccountKey(session.instanceUrl, session.account),
+                    )
+                }
+                services.companion.forget(_uiState.value.instanceUrl)
                 _uiState.update {
                     it.copy(
                         companion = CompanionState(),

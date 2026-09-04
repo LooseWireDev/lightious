@@ -1,6 +1,10 @@
 package com.loosewire.lightious.data
 
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.File
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -13,6 +17,8 @@ class SettingsStoreTest {
         val store = createStore(File.createTempFile("lightious-settings", ".preferences_pb"))
 
         assertEquals(ClientSettings(instanceUrl = "", proxyMedia = true), store.load())
+        assertEquals(true, store.load().selfHostEnabled)
+        assertEquals(false, store.load().managedServerAvailable)
     }
 
     @Test
@@ -40,9 +46,59 @@ class SettingsStoreTest {
         store.setProxyMedia(false)
 
         assertEquals(
-            ClientSettings(instanceUrl = "https://example.com", proxyMedia = false),
+            ClientSettings(
+                instanceUrl = "https://example.com",
+                selfHostEnabled = true,
+                proxyMedia = false,
+            ),
             store.load(),
         )
+    }
+
+    @Test
+    fun `migrates an existing explicit instance to self-host enabled`() = runTest {
+        val dataStore = createDataStore(File.createTempFile("lightious-settings", ".preferences_pb"))
+        dataStore.edit { preferences ->
+            preferences[stringPreferencesKey("invidious_instance_url")] = "https://example.com"
+        }
+
+        val settings = SettingsStore(dataStore).load()
+
+        assertEquals("https://example.com", settings.instanceUrl)
+        assertEquals(true, settings.selfHostEnabled)
+    }
+
+    @Test
+    fun `requires self-host and preserves its URL without a managed server`() = runTest {
+        val store = createStore(File.createTempFile("lightious-settings", ".preferences_pb"))
+        store.saveInstance("https://example.com")
+
+        assertFailsWith<IllegalArgumentException> {
+            store.setSelfHostEnabled(false)
+        }
+
+        assertEquals("https://example.com", store.load().instanceUrl)
+        assertEquals(true, store.load().selfHostEnabled)
+    }
+
+    @Test
+    fun `uses the built-in server when self-host is disabled and restores the custom server`() = runTest {
+        val dataStore = createDataStore(File.createTempFile("lightious-settings", ".preferences_pb"))
+        val store = SettingsStore(dataStore, defaultInstanceUrl = "https://lightious.example")
+
+        assertEquals("https://lightious.example", store.load().instanceUrl)
+        assertEquals(false, store.load().selfHostEnabled)
+        assertEquals(true, store.load().managedServerAvailable)
+
+        store.saveInstance("https://custom.example")
+
+        store.setSelfHostEnabled(false)
+        assertEquals("https://lightious.example", store.load().instanceUrl)
+        assertEquals(false, store.load().selfHostEnabled)
+
+        store.setSelfHostEnabled(true)
+        assertEquals("https://custom.example", store.load().instanceUrl)
+        assertEquals(true, store.load().selfHostEnabled)
     }
 
     @Test
@@ -103,11 +159,14 @@ class SettingsStoreTest {
     }
 
     private fun kotlinx.coroutines.test.TestScope.createStore(file: File): SettingsStore {
+        return SettingsStore(createDataStore(file))
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.createDataStore(file: File): DataStore<Preferences> {
         file.delete()
-        val dataStore = PreferenceDataStoreFactory.create(
+        return PreferenceDataStoreFactory.create(
             scope = backgroundScope,
             produceFile = { file },
         )
-        return SettingsStore(dataStore)
     }
 }

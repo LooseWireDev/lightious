@@ -33,6 +33,8 @@ data class CuratedVideo(
     val lengthSeconds: Long,
     val thumbnailUrl: String? = null,
     val playbackPolicy: PlaybackPolicy,
+    val authorId: String? = null,
+    val isShort: Boolean = false,
 ) {
     fun asVideoSummary(): VideoSummary = VideoSummary(
         videoId = videoId,
@@ -43,8 +45,26 @@ data class CuratedVideo(
         publishedText = if (playbackPolicy == PlaybackPolicy.LISTEN_ONLY) "LISTEN ONLY" else "VIDEO ENABLED",
         liveNow = false,
         thumbnailUrl = thumbnailUrl,
+        authorId = authorId,
+        isShort = isShort,
     )
 }
+
+@Serializable
+data class CuratedChannel(
+    val id: String,
+    val channelId: String,
+    val name: String,
+    val thumbnailUrl: String? = null,
+    val playbackPolicy: PlaybackPolicy,
+)
+
+@Serializable
+data class CuratedPlaylist(
+    val id: String,
+    val name: String,
+    val items: List<CuratedVideo> = emptyList(),
+)
 
 @Serializable
 data class CompanionProfile(
@@ -53,7 +73,62 @@ data class CompanionProfile(
     val revision: Long,
     val mode: ExperienceMode,
     val items: List<CuratedVideo>,
+    val channels: List<CuratedChannel> = emptyList(),
+    val playlists: List<CuratedPlaylist> = emptyList(),
+    val blockedVideoIds: Set<String> = emptySet(),
 )
+
+internal fun CompanionProfile?.effectiveExperienceMode(): ExperienceMode =
+    this?.mode ?: ExperienceMode.FOCUSED
+
+internal fun CompanionState.withoutUnverifiedProfile(): CompanionState = copy(profile = null)
+
+internal fun CompanionProfile.allCuratedVideos(): List<CuratedVideo> {
+    val blockedIds = knownShortVideoIds()
+    return buildList {
+        addAll(items)
+        playlists.forEach { playlist -> addAll(playlist.items) }
+    }.filter { video -> !video.isShort && video.videoId !in blockedIds }
+        .distinctBy(CuratedVideo::videoId)
+}
+
+internal fun CompanionProfile.knownShortVideoIds(): Set<String> = buildSet {
+    blockedVideoIds
+        .filter { videoId -> extractYouTubeVideoId(videoId) == videoId }
+        .forEach(::add)
+    items.filter(CuratedVideo::isShort).forEach { video -> add(video.videoId) }
+    playlists.forEach { playlist ->
+        playlist.items.filter(CuratedVideo::isShort).forEach { video -> add(video.videoId) }
+    }
+}
+
+internal fun CompanionProfile.withoutShorts(): CompanionProfile {
+    val blockedIds = knownShortVideoIds()
+    return copy(
+        items = items.filter { video -> !video.isShort && video.videoId !in blockedIds },
+        playlists = playlists.map { playlist ->
+            playlist.copy(
+                items = playlist.items.filter { video -> !video.isShort && video.videoId !in blockedIds },
+            )
+        },
+        blockedVideoIds = blockedIds,
+    )
+}
+
+internal fun CompanionProfile.playbackPolicyFor(
+    videoId: String,
+    authorId: String?,
+): PlaybackPolicy? {
+    if (videoId in knownShortVideoIds()) return null
+    return allCuratedVideos()
+        .firstOrNull { item -> item.videoId == videoId }
+        ?.playbackPolicy
+        ?: authorId
+            ?.takeIf(::validYouTubeChannelId)
+            ?.let { channelId ->
+                channels.firstOrNull { channel -> channel.channelId == channelId }?.playbackPolicy
+            }
+}
 
 data class CompanionSession(
     val instanceUrl: String,

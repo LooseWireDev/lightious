@@ -20,6 +20,7 @@ class SettingsStore(
         .takeIf(String::isNotBlank)
         ?.let(::normalizeInstanceUrl)
         .orEmpty()
+    private val managedServerAvailable = normalizedDefaultInstanceUrl.isNotBlank()
 
     val settings: Flow<ClientSettings> = dataStore.data
         .catch { error ->
@@ -37,6 +38,16 @@ class SettingsStore(
         val normalized = normalizeInstanceUrl(instanceUrl)
         dataStore.edit { preferences ->
             preferences[INSTANCE_URL] = normalized
+            preferences[SELF_HOST_ENABLED] = true
+        }
+    }
+
+    suspend fun setSelfHostEnabled(enabled: Boolean) {
+        require(enabled || managedServerAvailable) {
+            "A managed Lightious server is not configured yet."
+        }
+        dataStore.edit { preferences ->
+            preferences[SELF_HOST_ENABLED] = enabled
         }
     }
 
@@ -80,12 +91,20 @@ class SettingsStore(
 
     private fun settingsFromPreferences(preferences: Preferences): ClientSettings {
         val storedInstance = preferences[INSTANCE_URL]
-        val instanceUrl = storedInstance
+        val customInstanceUrl = storedInstance
             ?.let { runCatching { normalizeInstanceUrl(it) }.getOrNull() }
-            ?: normalizedDefaultInstanceUrl
+        val requestedSelfHost = preferences[SELF_HOST_ENABLED] ?: (customInstanceUrl != null)
+        val selfHostEnabled = requestedSelfHost || !managedServerAvailable
+        val instanceUrl = if (selfHostEnabled) {
+            customInstanceUrl ?: normalizedDefaultInstanceUrl
+        } else {
+            normalizedDefaultInstanceUrl
+        }
 
         return ClientSettings(
             instanceUrl = instanceUrl,
+            selfHostEnabled = selfHostEnabled,
+            managedServerAvailable = managedServerAvailable,
             proxyMedia = preferences[PROXY_MEDIA] ?: true,
             homePages = parseHomePages(preferences[HOME_PAGES]),
             saveSearchHistory = preferences[SAVE_SEARCH_HISTORY] ?: true,
@@ -112,6 +131,7 @@ class SettingsStore(
 
     private companion object {
         val INSTANCE_URL = stringPreferencesKey("invidious_instance_url")
+        val SELF_HOST_ENABLED = booleanPreferencesKey("invidious_self_host_enabled")
         val PROXY_MEDIA = booleanPreferencesKey("invidious_proxy_media")
         val HOME_PAGES = stringPreferencesKey("home_pages")
         val SAVE_SEARCH_HISTORY = booleanPreferencesKey("save_search_history")

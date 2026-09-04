@@ -24,6 +24,7 @@ import kotlinx.serialization.json.Json
 class InvidiousApi internal constructor(
     baseUrl: String,
     val proxyMedia: Boolean = true,
+    private val deviceBearer: String? = null,
     private val transport: InvidiousHttpTransport,
     val audioLanguage: AudioLanguagePreference = AudioLanguagePreference.ORIGINAL,
 ) : AutoCloseable {
@@ -36,24 +37,47 @@ class InvidiousApi internal constructor(
         explicitNulls = false
     }
 
+    init {
+        require(deviceBearer == null || validDeviceBearer(deviceBearer)) {
+            "Stored device credential is invalid."
+        }
+    }
+
     constructor(
         baseUrl: String,
         proxyMedia: Boolean = true,
         audioLanguage: AudioLanguagePreference = AudioLanguagePreference.ORIGINAL,
-    ) : this(baseUrl, proxyMedia, KtorInvidiousHttpTransport(), audioLanguage)
+    ) : this(baseUrl, proxyMedia, null, KtorInvidiousHttpTransport(), audioLanguage)
+
+    constructor(
+        baseUrl: String,
+        proxyMedia: Boolean = true,
+        deviceBearer: String?,
+        audioLanguage: AudioLanguagePreference = AudioLanguagePreference.ORIGINAL,
+    ) : this(baseUrl, proxyMedia, deviceBearer, KtorInvidiousHttpTransport(), audioLanguage)
 
     suspend fun popular(): Result<List<VideoSummary>> = runSuspendCatching {
-        val response = transport.get("$baseUrl/api/v1/popular")
+        val response = transport.get(
+            url = contentRoute("/popular"),
+            headers = contentHeaders(),
+        )
         response.requireSuccess("Popular videos")
         decodeVideoList(response.body)
     }
 
     suspend fun accountFeed(tokenInput: String): Result<List<VideoSummary>> = runSuspendCatching {
-        val token = normalizeAuthToken(tokenInput)
         val response = transport.get(
-            url = "$baseUrl/api/v1/auth/feed",
+            url = if (deviceBearer != null) {
+                lightiousRoute("/feed")
+            } else {
+                "$baseUrl/api/v1/auth/feed"
+            },
             parameters = mapOf("page" to "1", "max_results" to "40"),
-            headers = authorizationHeaders(token),
+            headers = if (deviceBearer != null) {
+                contentHeaders()
+            } else {
+                authorizationHeaders(normalizeAuthToken(tokenInput))
+            },
         )
         response.requireSuccess("Account feed")
         val feed = try {
@@ -70,14 +94,21 @@ class InvidiousApi internal constructor(
         tokenInput: String,
         maxResults: Int = 1,
     ): Result<List<String>> = runSuspendCatching {
-        val token = normalizeAuthToken(tokenInput)
         val response = transport.get(
-            url = "$baseUrl/api/v1/auth/history",
+            url = if (deviceBearer != null) {
+                lightiousRoute("/history")
+            } else {
+                "$baseUrl/api/v1/auth/history"
+            },
             parameters = mapOf(
                 "page" to "1",
                 "max_results" to maxResults.coerceIn(1, 100).toString(),
             ),
-            headers = authorizationHeaders(token),
+            headers = if (deviceBearer != null) {
+                contentHeaders()
+            } else {
+                authorizationHeaders(normalizeAuthToken(tokenInput))
+            },
         )
         response.requireSuccess("Account history")
         try {
@@ -91,12 +122,19 @@ class InvidiousApi internal constructor(
 
     suspend fun markWatched(tokenInput: String, videoIdOrUrl: String): Result<Unit> =
         runSuspendCatching {
-            val token = normalizeAuthToken(tokenInput)
             val videoId = extractYouTubeVideoId(videoIdOrUrl)
                 ?: throw IllegalArgumentException("Enter a valid YouTube video ID or URL.")
             val response = transport.post(
-                url = "$baseUrl/api/v1/auth/history/$videoId",
-                headers = authorizationHeaders(token),
+                url = if (deviceBearer != null) {
+                    lightiousRoute("/history/$videoId")
+                } else {
+                    "$baseUrl/api/v1/auth/history/$videoId"
+                },
+                headers = if (deviceBearer != null) {
+                    contentHeaders()
+                } else {
+                    authorizationHeaders(normalizeAuthToken(tokenInput))
+                },
             )
             response.requireSuccess("Account history update")
         }
@@ -104,6 +142,7 @@ class InvidiousApi internal constructor(
     suspend fun search(query: String): Result<List<VideoSummary>> = runSuspendCatching {
         val trimmedQuery = query.trim()
         require(trimmedQuery.isNotEmpty()) { "Enter a search query." }
+        if (isYouTubeShortsUrl(trimmedQuery)) return@runSuspendCatching emptyList()
 
         val directVideoId = extractYouTubeVideoId(trimmedQuery)
         if (directVideoId != null) {
@@ -111,15 +150,43 @@ class InvidiousApi internal constructor(
         }
 
         val response = transport.get(
-            url = "$baseUrl/api/v1/search",
+            url = contentRoute("/search"),
             parameters = mapOf(
                 "q" to trimmedQuery,
                 "type" to "video",
                 "sort_by" to "relevance",
             ),
+            headers = contentHeaders(),
         )
         response.requireSuccess("Search")
         decodeVideoList(response.body)
+    }
+
+    suspend fun channelVideos(
+        channelId: String,
+        continuation: String? = null,
+    ): Result<ChannelVideosPage> = runSuspendCatching {
+        require(validYouTubeChannelId(channelId)) { "The companion returned an invalid channel ID." }
+        val parameters = buildMap {
+            put("sort_by", "newest")
+            continuation?.takeIf(String::isNotBlank)?.let { value -> put("continuation", value) }
+        }
+        val response = transport.get(
+            url = contentRoute("/channels/$channelId/videos"),
+            parameters = parameters,
+            headers = contentHeaders(),
+        )
+        response.requireSuccess("Channel videos")
+        val page = try {
+            json.decodeFromString<InvidiousChannelVideosDto>(response.body)
+        } catch (error: SerializationException) {
+            throw InvidiousApiException("The instance returned an invalid channel video list.", cause = error)
+        }
+        ChannelVideosPage(
+            videos = page.videos.mapNotNull { item -> item.toVideoSummary() }
+                .distinctBy(VideoSummary::videoId),
+            continuation = page.continuation?.takeIf(String::isNotBlank),
+        )
     }
 
     suspend fun video(videoIdOrUrl: String): Result<VideoDetails> = runSuspendCatching {
@@ -129,13 +196,9 @@ class InvidiousApi internal constructor(
     }
 
     suspend fun probe(): InstanceProbe {
-        val searchResponse = try {
+        val statsResponse = try {
             transport.get(
-                url = "$baseUrl/api/v1/search",
-                parameters = mapOf(
-                    "q" to PROBE_QUERY,
-                    "type" to "video",
-                ),
+                url = "$baseUrl/api/v1/stats",
             )
         } catch (error: CancellationException) {
             throw error
@@ -150,20 +213,20 @@ class InvidiousApi internal constructor(
             )
         }
 
-        if (!searchResponse.isSuccessful) {
+        if (!statsResponse.isSuccessful) {
             return InstanceProbe(
                 instanceUrl = baseUrl,
                 reachable = true,
                 apiAvailable = false,
                 playbackAvailable = false,
                 rangeSupported = false,
-                apiStatusCode = searchResponse.statusCode,
-                message = "The instance search API returned HTTP ${searchResponse.statusCode}.",
+                apiStatusCode = statsResponse.statusCode,
+                message = "The instance stats API returned HTTP ${statsResponse.statusCode}.",
             )
         }
 
-        val searchVideos = try {
-            decodeVideoList(searchResponse.body)
+        val stats = try {
+            json.decodeFromString<InvidiousStatsDto>(statsResponse.body)
         } catch (error: Exception) {
             return InstanceProbe(
                 instanceUrl = baseUrl,
@@ -171,78 +234,21 @@ class InvidiousApi internal constructor(
                 apiAvailable = false,
                 playbackAvailable = false,
                 rangeSupported = false,
-                apiStatusCode = searchResponse.statusCode,
+                apiStatusCode = statsResponse.statusCode,
                 message = error.safeMessage("The instance returned an invalid API response."),
             )
         }
 
-        if (searchVideos.isEmpty()) {
+        if (!stats.software?.name.equals("invidious", ignoreCase = true)) {
             return InstanceProbe(
                 instanceUrl = baseUrl,
                 reachable = true,
-                apiAvailable = true,
+                apiAvailable = false,
                 playbackAvailable = false,
                 rangeSupported = false,
-                apiStatusCode = searchResponse.statusCode,
-                message = "The search API works, but it returned no video to test playback with.",
+                apiStatusCode = statsResponse.statusCode,
+                message = "The server did not identify itself as Invidious.",
             )
-        }
-
-        var lastVideoStatus: Int? = null
-        var lastPlaybackStatus: Int? = null
-        var lastRangeSupported = false
-        var lastMessage = "No playable stream was returned."
-        for (summary in searchVideos.take(MAX_PROBE_VIDEOS)) {
-            val details = try {
-                videoOrThrow(summary.videoId)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: InvidiousApiException) {
-                lastVideoStatus = error.statusCode
-                lastMessage = error.safeMessage("Video details could not be loaded.")
-                continue
-            } catch (error: Exception) {
-                lastMessage = error.safeMessage("Video details could not be loaded.")
-                continue
-            }
-
-            val mediaUrl = details.selection.watchProbeUrl
-            if (mediaUrl == null) {
-                lastMessage = "Video ${summary.videoId} had no usable media URL."
-                continue
-            }
-
-            val playbackResponse = try {
-                transport.readOneByte(mediaUrl)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                lastMessage = error.safeMessage("The media URL could not be reached.")
-                continue
-            }
-
-            val playbackAvailable = playbackResponse.isSuccessful && playbackResponse.receivedByte
-            if (playbackAvailable) {
-                return InstanceProbe(
-                    instanceUrl = baseUrl,
-                    reachable = true,
-                    apiAvailable = true,
-                    playbackAvailable = true,
-                    rangeSupported = playbackResponse.rangeSupported,
-                    apiStatusCode = searchResponse.statusCode,
-                    playbackStatusCode = playbackResponse.statusCode,
-                    videoId = summary.videoId,
-                    message = if (playbackResponse.rangeSupported) {
-                        "API and ranged media playback are available."
-                    } else {
-                        "Media playback is available, but the server ignored the byte range."
-                    },
-                )
-            }
-
-            lastPlaybackStatus = playbackResponse.statusCode
-            lastRangeSupported = playbackResponse.rangeSupported
-            lastMessage = "The media check returned HTTP ${playbackResponse.statusCode} without data."
         }
 
         return InstanceProbe(
@@ -250,10 +256,110 @@ class InvidiousApi internal constructor(
             reachable = true,
             apiAvailable = true,
             playbackAvailable = false,
-            rangeSupported = lastRangeSupported,
-            apiStatusCode = searchResponse.statusCode,
-            playbackStatusCode = lastPlaybackStatus ?: lastVideoStatus,
-            message = lastMessage,
+            rangeSupported = false,
+            apiStatusCode = statsResponse.statusCode,
+            message = "Invidious API is available. Search and playback will be checked when used.",
+        )
+    }
+
+    suspend fun probeAuthorized(sampleVideoId: String? = null): InstanceProbe {
+        require(deviceBearer != null) { "Authenticated probe requires a paired device credential." }
+        val normalizedVideoId = sampleVideoId
+            ?.takeIf(String::isNotBlank)
+            ?.let(::extractYouTubeVideoId)
+        if (normalizedVideoId == null) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = true,
+                playbackAvailable = false,
+                rangeSupported = false,
+                message = "Authenticated companion access is available.",
+            )
+        }
+
+        val details = try {
+            videoOrThrow(normalizedVideoId)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: InvidiousApiException) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = false,
+                playbackAvailable = false,
+                rangeSupported = false,
+                apiStatusCode = error.statusCode,
+                videoId = normalizedVideoId,
+                message = error.safeMessage("Authenticated video access failed."),
+            )
+        } catch (error: Exception) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = false,
+                playbackAvailable = false,
+                rangeSupported = false,
+                videoId = normalizedVideoId,
+                message = error.safeMessage("Authenticated video access failed."),
+            )
+        }
+
+        val mediaUrl = details.selection.watchProbeUrl
+        if (mediaUrl == null) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = true,
+                playbackAvailable = false,
+                rangeSupported = false,
+                videoId = normalizedVideoId,
+                message = "Authenticated companion access is available, but the library item had no playable media URL.",
+            )
+        }
+
+        val playbackResponse = try {
+            transport.readOneByte(mediaUrl)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = true,
+                playbackAvailable = false,
+                rangeSupported = false,
+                videoId = normalizedVideoId,
+                message = error.safeMessage("Authenticated media playback could not be reached."),
+            )
+        }
+
+        if (playbackResponse.isSuccessful && playbackResponse.receivedByte) {
+            return InstanceProbe(
+                instanceUrl = baseUrl,
+                reachable = true,
+                apiAvailable = true,
+                playbackAvailable = true,
+                rangeSupported = playbackResponse.rangeSupported,
+                playbackStatusCode = playbackResponse.statusCode,
+                videoId = normalizedVideoId,
+                message = if (playbackResponse.rangeSupported) {
+                    "Authenticated API and ranged media playback are available."
+                } else {
+                    "Authenticated media playback is available, but the server ignored the byte range."
+                },
+            )
+        }
+
+        return InstanceProbe(
+            instanceUrl = baseUrl,
+            reachable = true,
+            apiAvailable = true,
+            playbackAvailable = false,
+            rangeSupported = playbackResponse.rangeSupported,
+            playbackStatusCode = playbackResponse.statusCode,
+            videoId = normalizedVideoId,
+            message = "The authenticated media check returned HTTP ${playbackResponse.statusCode} without data.",
         )
     }
 
@@ -263,8 +369,9 @@ class InvidiousApi internal constructor(
 
     private suspend fun videoOrThrow(videoId: String): VideoDetails {
         val response = transport.get(
-            url = "$baseUrl/api/v1/videos/$videoId",
-            parameters = mapOf("local" to proxyMedia.toString()),
+            url = contentRoute("/videos/$videoId"),
+            parameters = if (deviceBearer != null) emptyMap() else mapOf("local" to proxyMedia.toString()),
+            headers = contentHeaders(),
         )
         response.requireSuccess("Video details")
 
@@ -273,7 +380,9 @@ class InvidiousApi internal constructor(
         } catch (error: SerializationException) {
             throw InvidiousApiException("The instance returned invalid video details.", cause = error)
         }
-        return dto.toVideoDetails(videoId)
+        return dto.toVideoDetails(videoId).also { details ->
+            if (details.summary.isShort) throw InvidiousApiException(SHORTS_BLOCKED_MESSAGE, statusCode = 403)
+        }
     }
 
     private fun decodeVideoList(body: String): List<VideoSummary> {
@@ -286,7 +395,9 @@ class InvidiousApi internal constructor(
     }
 
     private fun InvidiousVideoItemDto.toVideoSummary(): VideoSummary? {
-        if (type != null && type.lowercase() !in VIDEO_ITEM_TYPES) return null
+        val normalizedType = type?.lowercase()
+        if (normalizedType == SHORT_VIDEO_ITEM_TYPE || isShort.asBooleanOrNull() == true) return null
+        if (normalizedType != null && normalizedType !in VIDEO_ITEM_TYPES) return null
         val id = videoId?.takeIf { extractYouTubeVideoId(it) == it } ?: return null
         return VideoSummary(
             videoId = id,
@@ -297,6 +408,8 @@ class InvidiousApi internal constructor(
             publishedText = publishedText.orEmpty(),
             liveNow = liveNow.asBooleanOrNull() ?: false,
             thumbnailUrl = chooseThumbnail(videoThumbnails),
+            authorId = authorId?.takeIf(::validYouTubeChannelId),
+            isShort = false,
         )
     }
 
@@ -311,6 +424,9 @@ class InvidiousApi internal constructor(
             publishedText = publishedText.orEmpty(),
             liveNow = liveNow.asBooleanOrNull() ?: false,
             thumbnailUrl = chooseThumbnail(videoThumbnails),
+            authorId = authorId?.takeIf(::validYouTubeChannelId),
+            isShort = type.equals(SHORT_VIDEO_ITEM_TYPE, ignoreCase = true) ||
+                isShort.asBooleanOrNull() == true,
         )
 
         val progressive = formatStreams.orEmpty().mapNotNull { format ->
@@ -413,14 +529,23 @@ class InvidiousApi internal constructor(
     }
 
     private companion object {
-        const val MAX_PROBE_VIDEOS = 3
-        const val PROBE_QUERY = "Light"
         const val MIN_THUMBNAIL_WIDTH = 300
         const val MAX_THUMBNAIL_WIDTH = 720
-        val VIDEO_ITEM_TYPES = setOf("video", "shortvideo")
+        val VIDEO_ITEM_TYPES = setOf("video")
+        const val SHORT_VIDEO_ITEM_TYPE = "shortvideo"
         val CODECS = Regex("""codecs\s*=\s*[\"']([^\"']+)[\"']""", RegexOption.IGNORE_CASE)
     }
+
+    private fun contentRoute(path: String): String =
+        if (deviceBearer != null) lightiousRoute(path) else "$baseUrl/api/v1$path"
+
+    private fun lightiousRoute(path: String): String = "$baseUrl/api/lightious/v1$path"
+
+    private fun contentHeaders(): Map<String, String> =
+        deviceBearer?.let(::authorizationHeaders).orEmpty()
 }
+
+internal const val SHORTS_BLOCKED_MESSAGE = "Shorts are not available in Lightious."
 
 private fun String.audioLanguageFromTrackId(): String =
     replace(Regex("\\.\\d+$"), "")

@@ -8,12 +8,77 @@ import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class CompanionStoreTest {
+    @Test
+    fun `older cached profile defaults channels playlists and author id`() {
+        val profile = Json { ignoreUnknownKeys = true }.decodeFromString<CompanionProfile>(
+            """
+            {
+              "deviceId":"device-1",
+              "account":"gav",
+              "revision":1,
+              "mode":"FOCUSED",
+              "items":[{
+                "id":"item-1",
+                "videoId":"dQw4w9WgXcQ",
+                "title":"A video",
+                "author":"A channel",
+                "lengthSeconds":213,
+                "playbackPolicy":"LISTEN_ONLY"
+              }]
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(emptyList(), profile.channels)
+        assertEquals(emptyList(), profile.playlists)
+        assertNull(profile.items.single().authorId)
+        assertFalse(profile.items.single().isShort)
+    }
+
+    @Test
+    fun `cached profiles never return explicitly flagged Shorts`() = runTest {
+        val store = CompanionStore(
+            createDataStore(File.createTempFile("lightious-short-cache", ".preferences_pb")),
+            FakeCipher(),
+        )
+        val session = CompanionSession("https://example.com", "device-1", "gav", DEVICE_BEARER)
+        val short = CuratedVideo(
+            id = "short-item",
+            videoId = "dQw4w9WgXcQ",
+            title = "A Short",
+            author = "A channel",
+            lengthSeconds = 30,
+            playbackPolicy = PlaybackPolicy.WATCH_AND_LISTEN,
+            isShort = true,
+        )
+        store.saveSession(session)
+        store.saveProfile(
+            session.instanceUrl,
+            CompanionProfile(
+                deviceId = session.deviceId,
+                account = session.account,
+                revision = 1,
+                mode = ExperienceMode.FOCUSED,
+                items = listOf(short),
+                playlists = listOf(CuratedPlaylist("playlist", "Playlist", listOf(short))),
+            ),
+        )
+
+        val cached = store.load(session.instanceUrl).profile
+
+        assertTrue(cached?.items.orEmpty().isEmpty())
+        assertTrue(cached?.playlists?.single()?.items.orEmpty().isEmpty())
+    }
+
     @Test
     fun `device credential is encrypted and cached profile is instance scoped`() = runTest {
         val dataStore = createDataStore(File.createTempFile("lightious-companion", ".preferences_pb"))
@@ -38,6 +103,21 @@ class CompanionStoreTest {
                     author = "A channel",
                     lengthSeconds = 213,
                     playbackPolicy = PlaybackPolicy.LISTEN_ONLY,
+                ),
+            ),
+            channels = listOf(
+                CuratedChannel(
+                    id = "channel-1",
+                    channelId = "UCXuqSBlHAE6Xw-yeJA0Tunw",
+                    name = "A channel",
+                    playbackPolicy = PlaybackPolicy.WATCH_AND_LISTEN,
+                ),
+            ),
+            playlists = listOf(
+                CuratedPlaylist(
+                    id = "playlist-1",
+                    name = "Bedtime",
+                    items = emptyList(),
                 ),
             ),
         )

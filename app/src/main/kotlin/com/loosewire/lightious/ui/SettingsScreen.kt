@@ -20,12 +20,16 @@ import com.loosewire.lightious.data.AccountSession
 import com.loosewire.lightious.data.AudioLanguagePreference
 import com.loosewire.lightious.data.ClientSettings
 import com.loosewire.lightious.data.CompanionState
+import com.loosewire.lightious.data.ExperienceMode
 import com.loosewire.lightious.data.HomePage
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.authTokenAllowsHistoryWrite
 import com.loosewire.lightious.data.buildAuthorizationUrl
+import com.loosewire.lightious.data.effectiveExperienceMode
 import com.loosewire.lightious.data.normalizeAuthToken
 import com.loosewire.lightious.data.normalizeInstanceUrl
+import com.loosewire.lightious.data.pairedHistoryAccountKey
+import com.loosewire.lightious.data.withoutUnverifiedProfile
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -77,14 +81,27 @@ class SettingsViewModel(
 
     fun load() {
         requestJob?.cancel()
+        _uiState.update { state ->
+            state.copy(
+                companion = state.companion.withoutUnverifiedProfile(),
+                loading = true,
+                errorMessage = null,
+            )
+        }
         requestJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val settings = services.settings.load()
+                var companionError: String? = null
+                val companion = services.companion.loadActiveState(settings.instanceUrl).getOrElse { error ->
+                    companionError = error.userMessage("Could not verify companion settings.")
+                    services.companion.load(settings.instanceUrl).withoutUnverifiedProfile()
+                }
                 _uiState.value = SettingsUiState(
                     settings = settings,
                     signedIn = services.accounts.load(settings.instanceUrl) != null,
-                    companion = services.companion.load(settings.instanceUrl),
+                    companion = companion,
                     loading = false,
+                    errorMessage = companionError,
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -96,8 +113,31 @@ class SettingsViewModel(
         }
     }
 
-    fun toggleProxyMedia() = updateSetting(
-        save = { services.settings.setProxyMedia(!it.proxyMedia) },
+    fun toggleProxyMedia() {
+        requestJob?.cancel()
+        requestJob = viewModelScope.launch(Dispatchers.IO) {
+            if (_uiState.value.companion.session != null) {
+                _uiState.update {
+                    it.copy(
+                        errorMessage = "Paired playback always stays on the Lightious gateway. Proxy Media only changes unpaired or custom playback.",
+                    )
+                }
+                return@launch
+            }
+            try {
+                services.settings.setProxyMedia(!_uiState.value.settings.proxyMedia)
+                requestJob = null
+                load()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _uiState.update { it.copy(errorMessage = error.userMessage("Could not save this setting.")) }
+            }
+        }
+    }
+
+    fun toggleSelfHost() = updateSetting(
+        save = { services.settings.setSelfHostEnabled(!it.selfHostEnabled) },
     )
 
     fun toggleSearchHistory() = updateSetting(
@@ -197,6 +237,7 @@ class SettingsScreen(
                                 resultCallback = viewModel::setAudioLanguage,
                             )
                         },
+                        onSelfHost = viewModel::toggleSelfHost,
                         onProxy = viewModel::toggleProxyMedia,
                         onSearchHistory = viewModel::toggleSearchHistory,
                         onWatchHistory = viewModel::toggleWatchHistory,
@@ -219,6 +260,7 @@ private fun SettingsContent(
     onCompanion: () -> Unit,
     onPages: () -> Unit,
     onAudioLanguage: () -> Unit,
+    onSelfHost: () -> Unit,
     onProxy: () -> Unit,
     onSearchHistory: () -> Unit,
     onWatchHistory: () -> Unit,
@@ -237,7 +279,6 @@ private fun SettingsContent(
                 .fillMaxSize()
                 .padding(horizontal = 1f.gridUnitsAsDp()),
         ) {
-            SettingRow("INVIDIOUS SERVER", state.settings.instanceUrl, onInstance)
             SettingRow(
                 "COMPANION",
                 when {
@@ -248,41 +289,80 @@ private fun SettingsContent(
                 onCompanion,
             )
             SettingRow(
-                "ACCOUNT",
-                if (state.signedIn) "SIGNED IN" else "NOT SIGNED IN",
-                onAccount,
-            )
-            SettingRow(
-                "BOTTOM NAVIGATION",
-                state.settings.homePages.joinToString(" · ") { it.homeLabel() },
-                onPages,
-            )
-            SettingRow(
                 "AUDIO LANGUAGE",
                 state.settings.audioLanguage.displayName.uppercase(),
                 onAudioLanguage,
             )
             SettingRow(
-                "PROXY MEDIA",
-                if (state.settings.proxyMedia) "ON" else "OFF",
-                onProxy,
+                "SELF-HOST",
+                when {
+                    !state.settings.managedServerAvailable -> "REQUIRED"
+                    state.settings.selfHostEnabled -> "ON"
+                    else -> "OFF"
+                },
+                onSelfHost,
             )
-            SettingRow(
-                "SAVE SEARCH HISTORY",
-                if (state.settings.saveSearchHistory) "ON — local only" else "OFF — existing entries kept",
-                onSearchHistory,
-            )
-            SettingRow(
-                "SAVE WATCH HISTORY",
-                if (state.settings.saveWatchHistory) "ON — local only" else "OFF — existing entries kept",
-                onWatchHistory,
-            )
-            LightText(
-                text = "Search history stays on this phone. Signed-in watch sync is controlled in Account.",
-                variant = LightTextVariant.Detail,
-                lighten = true,
-                modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
-            )
+            if (state.settings.selfHostEnabled) {
+                SettingRow("INVIDIOUS SERVER", state.settings.instanceUrl, onInstance)
+            }
+            if (state.companion.profile.effectiveExperienceMode() == ExperienceMode.FOCUSED) {
+                LightText(
+                    text = if (state.settings.selfHostEnabled) {
+                        if (state.settings.managedServerAvailable) {
+                            "Self-hosting is intended for compatible Lightious servers. Your saved server is kept if you turn it off."
+                        } else {
+                            "A managed Lightious server is not configured yet, so Self-host is required for this build."
+                        }
+                    } else {
+                        "Server details stay hidden. Turn on Self-host only if you run a compatible Lightious server."
+                    },
+                    variant = LightTextVariant.Detail,
+                    lighten = true,
+                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                )
+            } else {
+                SettingRow(
+                    "ACCOUNT",
+                    if (state.signedIn) "SIGNED IN" else "NOT SIGNED IN",
+                    onAccount,
+                )
+                SettingRow(
+                    "BOTTOM NAVIGATION",
+                    state.settings.homePages.joinToString(" · ") { it.homeLabel() },
+                    onPages,
+                )
+                SettingRow(
+                    "PROXY MEDIA",
+                    if (state.companion.session != null) {
+                        "PAIRED — GATEWAY REQUIRED"
+                    } else if (state.settings.proxyMedia) {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    onProxy,
+                )
+                SettingRow(
+                    "SAVE SEARCH HISTORY",
+                    if (state.settings.saveSearchHistory) "ON — local only" else "OFF — existing entries kept",
+                    onSearchHistory,
+                )
+                SettingRow(
+                    "SAVE WATCH HISTORY",
+                    if (state.settings.saveWatchHistory) "ON — local only" else "OFF — existing entries kept",
+                    onWatchHistory,
+                )
+                LightText(
+                    text = if (state.companion.session != null) {
+                        "Search history stays on this phone. Watched-state sync is controlled in Account, and paired playback always uses the companion gateway."
+                    } else {
+                        "Search history stays on this phone. Watched-state sync is controlled in Account."
+                    },
+                    variant = LightTextVariant.Detail,
+                    lighten = true,
+                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                )
+            }
         }
     }
 }
@@ -448,6 +528,7 @@ class HomePagesScreen(
 data class AccountUiState(
     val settings: ClientSettings = ClientSettings(),
     val account: AccountSession? = null,
+    val companion: CompanionState = CompanionState(),
     val loading: Boolean = true,
     val authorizationUrl: String = "",
     val errorMessage: String? = null,
@@ -471,6 +552,7 @@ class AccountViewModel(
             _uiState.value = AccountUiState(
                 settings = settings,
                 account = services.accounts.load(settings.instanceUrl),
+                companion = services.companion.load(settings.instanceUrl),
                 loading = false,
                 authorizationUrl = buildAuthorizationUrl(
                     settings.instanceUrl,
@@ -488,8 +570,12 @@ class AccountViewModel(
         requestJob?.cancel()
         _uiState.update { it.copy(loading = true, errorMessage = null) }
         requestJob = viewModelScope.launch(Dispatchers.IO) {
-            val settings = _uiState.value.settings
-            if (settings.syncAccountHistory && !authTokenAllowsHistoryWrite(token)) {
+            val state = _uiState.value
+            if (
+                state.companion.session == null &&
+                state.settings.syncAccountHistory &&
+                !authTokenAllowsHistoryWrite(token)
+            ) {
                 _uiState.update {
                     it.copy(
                         loading = false,
@@ -499,9 +585,9 @@ class AccountViewModel(
                 return@launch
             }
             InvidiousApi(
-                settings.instanceUrl,
-                settings.proxyMedia,
-                settings.audioLanguage,
+                state.settings.instanceUrl,
+                state.settings.proxyMedia,
+                state.settings.audioLanguage,
             ).use { api ->
                 val feed = api.accountFeed(token)
                 val failure = feed.exceptionOrNull()
@@ -518,7 +604,7 @@ class AccountViewModel(
                 }
             }
             try {
-                services.accounts.save(settings.instanceUrl, token)
+                services.accounts.save(state.settings.instanceUrl, token)
                 requestJob = null
                 load()
             } catch (error: CancellationException) {
@@ -554,7 +640,13 @@ class AccountViewModel(
             try {
                 val enabling = !_uiState.value.settings.syncAccountHistory
                 val account = _uiState.value.account
-                if (enabling && account != null && !authTokenAllowsHistoryWrite(account.token)) {
+                val pairedSession = _uiState.value.companion.session
+                if (
+                    enabling &&
+                    pairedSession == null &&
+                    account != null &&
+                    !authTokenAllowsHistoryWrite(account.token)
+                ) {
                     _uiState.update {
                         it.copy(
                             errorMessage = "Sign out, turn on watch sync, then authorize again to grant access.",
@@ -565,6 +657,11 @@ class AccountViewModel(
                 if (!enabling) {
                     account?.let { account ->
                         services.history.clearPendingServerWatches(account.accountKey)
+                    }
+                    pairedSession?.let { session ->
+                        services.history.clearPendingServerWatches(
+                            pairedHistoryAccountKey(session.instanceUrl, session.account),
+                        )
                     }
                 }
                 services.settings.setAccountHistorySyncEnabled(enabling)
@@ -623,7 +720,7 @@ class AccountScreen(
                                     ConfirmScreen(
                                         activity,
                                         title = "Sign Out",
-                                        message = "Remove this Invidious account token? Local histories are kept.",
+                                        message = "Remove this saved Invidious API token? Local histories and Companion pairing are kept.",
                                         confirmLabel = "SIGN OUT",
                                     )
                                 },
@@ -651,6 +748,7 @@ private fun AccountContent(
     onSignOut: () -> Unit,
     onToggleSync: () -> Unit,
 ) {
+    val pairedSession = state.companion.session
     Column(modifier = Modifier.fillMaxSize()) {
         LightTopBar(
             leftButton = LightBarButton.LightIcon(
@@ -665,9 +763,45 @@ private fun AccountContent(
                 .fillMaxSize()
                 .padding(horizontal = 1f.gridUnitsAsDp()),
         ) {
-            if (state.account == null) {
+            if (pairedSession != null) {
                 LightText(
-                    text = "Sign in with a restricted Invidious API token. Lightious never receives your password.",
+                    text = "STATUS  ·  PAIRED",
+                    variant = LightTextVariant.Copy,
+                    modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
+                )
+                LightText(
+                    text = "Watched-state sync can use the paired gateway on this phone. A separate Invidious API token is only needed on unpaired or custom servers.",
+                    variant = LightTextVariant.Detail,
+                    lighten = true,
+                    modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()),
+                )
+                SettingRow(
+                    "SYNC WATCHED STATE",
+                    if (state.settings.syncAccountHistory) {
+                        "ON — future watches sync through pairing"
+                    } else {
+                        "OFF"
+                    },
+                    onToggleSync,
+                )
+                if (state.account != null) {
+                    LightText(
+                        text = "LEGACY TOKEN  ·  SAVED",
+                        variant = LightTextVariant.Detail,
+                        lighten = true,
+                        modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()),
+                    )
+                    ActionRow("REMOVE LEGACY TOKEN") { onSignOut() }
+                }
+                LightText(
+                    text = "Invidious receives watched video IDs only. Playback bytes still stay behind the paired media gateway.",
+                    variant = LightTextVariant.Detail,
+                    lighten = true,
+                    modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()),
+                )
+            } else if (state.account == null) {
+                LightText(
+                    text = "Sign in with a restricted Invidious API token only when this phone is not paired. Lightious never receives your password.",
                     variant = LightTextVariant.Copy,
                     modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                 )
@@ -758,11 +892,34 @@ class InstanceEditorViewModel(
             } else {
                 null
             }
-            val probe = InvidiousApi(
-                normalized,
-                oldSettings.proxyMedia,
-                oldSettings.audioLanguage,
-            ).use { it.probe() }
+            val oldCompanion = if (oldSettings.instanceUrl != normalized) {
+                services.companion.load(oldSettings.instanceUrl)
+            } else {
+                CompanionState()
+            }
+            val probe = if (oldSettings.instanceUrl == normalized) {
+                services.companion.probeSavedInstance(
+                    instanceUrl = normalized,
+                    proxyMedia = oldSettings.proxyMedia,
+                    audioLanguage = oldSettings.audioLanguage,
+                ).getOrElse { error ->
+                    _uiState.update {
+                        it.copy(
+                            initialValue = normalized,
+                            session = it.session + 1,
+                            loading = false,
+                            errorMessage = error.userMessage("Could not verify companion access."),
+                        )
+                    }
+                    return@launch
+                }
+            } else {
+                InvidiousApi(
+                    baseUrl = normalized,
+                    proxyMedia = oldSettings.proxyMedia,
+                    audioLanguage = oldSettings.audioLanguage,
+                ).use { it.probe() }
+            }
             if (!probe.apiAvailable) {
                 _uiState.update {
                     it.copy(
@@ -784,9 +941,17 @@ class InstanceEditorViewModel(
                             }
                         } finally {
                             try {
-                                services.accounts.clear()
+                                oldCompanion.session?.let { session ->
+                                    services.history.clearPendingServerWatches(
+                                        pairedHistoryAccountKey(session.instanceUrl, session.account),
+                                    )
+                                }
                             } finally {
-                                services.companion.forget()
+                                try {
+                                    services.accounts.clear()
+                                } finally {
+                                    services.companion.forget(oldSettings.instanceUrl)
+                                }
                             }
                         }
                     }

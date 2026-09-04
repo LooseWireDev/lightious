@@ -13,9 +13,11 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.ExperienceMode
 import com.loosewire.lightious.data.HomePage
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.VideoSummary
+import com.loosewire.lightious.data.effectiveExperienceMode
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -44,6 +46,7 @@ import kotlinx.coroutines.launch
 sealed interface NetworkPageMode {
     data object Loading : NetworkPageMode
     data object SignInRequired : NetworkPageMode
+    data class Blocked(val message: String) : NetworkPageMode
     data class Loaded(val videos: List<VideoSummary>) : NetworkPageMode
 }
 
@@ -73,22 +76,42 @@ class NetworkPageViewModel(
         requestJob = viewModelScope.launch(Dispatchers.IO) {
             val settings = services.settings.load()
             _uiState.update { it.copy(settings = settings) }
+            val companion = services.companion.loadActiveState(settings.instanceUrl).getOrElse { error ->
+                _uiState.update {
+                    it.copy(
+                        mode = NetworkPageMode.Loaded(emptyList()),
+                        errorMessage = error.userMessage("Could not verify companion access."),
+                    )
+                }
+                return@launch
+            }
+            if (companion.profile.effectiveExperienceMode() == ExperienceMode.FOCUSED) {
+                _uiState.update {
+                    it.copy(
+                        mode = NetworkPageMode.Blocked(
+                            message = "${page.homeLabel()} is disabled while Focused mode is enabled.",
+                        ),
+                    )
+                }
+                return@launch
+            }
             val account = if (page == HomePage.ACCOUNT_FEED) {
                 services.accounts.load(settings.instanceUrl)
             } else {
                 null
             }
-            if (page == HomePage.ACCOUNT_FEED && account == null) {
+            if (page == HomePage.ACCOUNT_FEED && companion.session == null && account == null) {
                 _uiState.update { it.copy(mode = NetworkPageMode.SignInRequired) }
                 return@launch
             }
             InvidiousApi(
-                settings.instanceUrl,
-                settings.proxyMedia,
-                settings.audioLanguage,
+                baseUrl = settings.instanceUrl,
+                proxyMedia = settings.proxyMedia,
+                deviceBearer = companion.session?.deviceBearer,
+                audioLanguage = settings.audioLanguage,
             ).use { api ->
                 val result = when (page) {
-                    HomePage.ACCOUNT_FEED -> api.accountFeed(checkNotNull(account).token)
+                    HomePage.ACCOUNT_FEED -> api.accountFeed(account?.token.orEmpty())
                     HomePage.POPULAR -> api.popular()
                     else -> Result.failure(IllegalArgumentException("This is not a network page."))
                 }
@@ -175,6 +198,11 @@ class NetworkPageScreen(
                             )
                         },
                     )
+                    is NetworkPageMode.Blocked -> BlockedNetworkPageContent(
+                        title = page.homeLabel(),
+                        message = mode.message,
+                        onBack = { goBack() },
+                    )
                     is NetworkPageMode.Loaded -> VideoListContent(
                         title = page.homeLabel(),
                         videos = mode.videos,
@@ -191,6 +219,35 @@ class NetworkPageScreen(
                     LightFullscreenModal(message = message, onClose = viewModel::dismissError)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BlockedNetworkPageContent(
+    title: String,
+    message: String,
+    onBack: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        LightTopBar(
+            leftButton = LightBarButton.LightIcon(
+                icon = LightIcons.BACK,
+                onClick = onBack,
+                contentDescription = "Back",
+            ),
+            center = LightTopBarCenter.Text(title),
+        )
+        LightScrollView(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 1f.gridUnitsAsDp()),
+        ) {
+            LightText(
+                text = message,
+                variant = LightTextVariant.Copy,
+                modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+            )
         }
     }
 }

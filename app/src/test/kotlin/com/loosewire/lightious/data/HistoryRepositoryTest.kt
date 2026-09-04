@@ -3,9 +3,14 @@ package com.loosewire.lightious.data
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class HistoryRepositoryTest {
+    private companion object {
+        const val TEST_DEVICE_BEARER = "lpt_device_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+
     @Test
     fun `search history deduplicates normalized queries and orders newest first`() = runTest {
         val dao = FakeHistoryDao()
@@ -32,6 +37,7 @@ class HistoryRepositoryTest {
 
         repository.recordSearch("https://youtu.be/dQw4w9WgXcQ?t=12")
         repository.recordSearch("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        repository.recordSearch("https://www.youtube.com/shorts/dQw4w9WgXcQ")
 
         assertTrue(repository.searchHistory().isEmpty())
     }
@@ -53,6 +59,47 @@ class HistoryRepositoryTest {
         assertEquals(listOf("first-video", "second-video"), history.map { it.video.videoId })
         assertEquals("Updated title", history.first().video.title)
         assertEquals(300L, history.first().lastWatchedAt)
+    }
+
+    @Test
+    fun `explicit Shorts are never recorded or queued for history sync`() = runTest {
+        val dao = FakeHistoryDao()
+        val repository = HistoryRepository(dao, now = { 100L })
+        val syncer = HistorySyncer(repository)
+        val short = video("short-video", "A Short").copy(isShort = true)
+
+        repository.recordWatch(short)
+        syncer.recordPlayback(
+            video = short,
+            settings = ClientSettings(saveWatchHistory = true, syncAccountHistory = true),
+            account = AccountSession("https://invidious.example", "token", "account"),
+        )
+
+        assertTrue(repository.watchHistory().isEmpty())
+        assertTrue(repository.pendingServerWatches("account").isEmpty())
+    }
+
+    @Test
+    fun `sync purges known Shorts from cached watch history and pending outbox`() = runTest {
+        val dao = FakeHistoryDao()
+        val repository = HistoryRepository(dao, now = { 100L })
+        val video = video("dQw4w9WgXcQ", "Previously cached")
+        repository.recordWatch(video)
+        repository.enqueueServerWatch("account", video.videoId)
+
+        repository.reconcile(
+            CompanionProfile(
+                deviceId = "0123456789abcdef0123456789abcdef",
+                account = "account",
+                revision = 2,
+                mode = ExperienceMode.EXPLORE,
+                items = emptyList(),
+                blockedVideoIds = setOf(video.videoId),
+            ),
+        )
+
+        assertTrue(repository.watchHistory().isEmpty())
+        assertTrue(repository.pendingServerWatches("account").isEmpty())
     }
 
     @Test
@@ -141,6 +188,88 @@ class HistoryRepositoryTest {
         )
     }
 
+    @Test
+    fun `paired sync target uses paired credential and account key`() {
+        val account = AccountSession(
+            instanceUrl = "https://invidious.example",
+            token = "legacy-token",
+            accountKey = "legacy-account",
+        )
+        val cachedCompanion = CompanionState(
+            session = CompanionSession(
+                instanceUrl = "https://invidious.example",
+                deviceId = "0123456789abcdef0123456789abcdef",
+                account = "@paired",
+                deviceBearer = TEST_DEVICE_BEARER,
+            ),
+        )
+        val activeCompanion = Result.success(cachedCompanion)
+
+        val target = selectHistorySyncTarget(
+            instanceUrl = "https://invidious.example",
+            account = account,
+            cachedCompanion = cachedCompanion,
+            activeCompanion = activeCompanion,
+        )
+
+        assertEquals(
+            pairedHistoryAccountKey("https://invidious.example", "@paired"),
+            target?.accountKey,
+        )
+        assertEquals("https://invidious.example", target?.instanceUrl)
+        assertEquals(
+            TEST_DEVICE_BEARER,
+            target?.deviceBearer,
+        )
+        assertEquals("", target?.token)
+    }
+
+    @Test
+    fun `paired sync target does not downgrade to legacy token after paired failure`() {
+        val account = AccountSession(
+            instanceUrl = "https://invidious.example",
+            token = "legacy-token",
+            accountKey = "legacy-account",
+        )
+        val cachedCompanion = CompanionState(
+            session = CompanionSession(
+                instanceUrl = "https://invidious.example",
+                deviceId = "0123456789abcdef0123456789abcdef",
+                account = "@paired",
+                deviceBearer = TEST_DEVICE_BEARER,
+            ),
+        )
+
+        val target = selectHistorySyncTarget(
+            instanceUrl = "https://invidious.example",
+            account = account,
+            cachedCompanion = cachedCompanion,
+            activeCompanion = Result.failure(IllegalStateException("revoked")),
+        )
+
+        assertNull(target)
+    }
+
+    @Test
+    fun `legacy sync target is used when the phone is not paired`() {
+        val account = AccountSession(
+            instanceUrl = "https://invidious.example",
+            token = "legacy-token",
+            accountKey = "legacy-account",
+        )
+
+        val target = selectHistorySyncTarget(
+            instanceUrl = "https://invidious.example",
+            account = account,
+            cachedCompanion = CompanionState(),
+        )
+
+        assertEquals("legacy-account", target?.accountKey)
+        assertEquals("https://invidious.example", target?.instanceUrl)
+        assertEquals("legacy-token", target?.token)
+        assertNull(target?.deviceBearer)
+    }
+
     private fun video(videoId: String, title: String): VideoSummary = VideoSummary(
         videoId = videoId,
         title = title,
@@ -194,6 +323,10 @@ class HistoryRepositoryTest {
             watches.clear()
         }
 
+        override suspend fun deleteWatch(videoId: String) {
+            watches.remove(videoId)
+        }
+
         override suspend fun enqueueServerWatch(entity: ServerHistoryOutboxEntity) {
             outbox[entity.accountKey to entity.videoId] = entity
         }
@@ -214,6 +347,10 @@ class HistoryRepositoryTest {
 
         override suspend fun clearPendingServerWatches(accountKey: String) {
             outbox.entries.removeAll { it.value.accountKey == accountKey }
+        }
+
+        override suspend fun deletePendingServerWatchForVideo(videoId: String) {
+            outbox.entries.removeAll { it.value.videoId == videoId }
         }
     }
 }

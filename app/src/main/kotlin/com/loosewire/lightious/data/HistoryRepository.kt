@@ -17,7 +17,7 @@ class HistoryRepository internal constructor(
 
     suspend fun recordSearch(query: String) {
         val display = query.trim().replace(Regex("\\s+"), " ")
-        if (display.isEmpty() || extractYouTubeVideoId(display) != null) return
+        if (display.isEmpty() || extractYouTubeVideoId(display) != null || isYouTubeShortsUrl(display)) return
         val normalized = display.lowercase(Locale.ROOT)
         val existing = dao.findSearch(normalized)
         dao.upsertSearch(
@@ -51,6 +51,7 @@ class HistoryRepository internal constructor(
         }
 
     suspend fun recordWatch(video: VideoSummary) {
+        if (video.isShort) return
         dao.upsertWatch(
             WatchHistoryEntity(
                 videoId = video.videoId,
@@ -69,6 +70,13 @@ class HistoryRepository internal constructor(
 
     suspend fun clearWatchHistory(accountKey: String? = null) =
         dao.clearWatchHistoryAndPending(accountKey)
+
+    suspend fun reconcile(profile: CompanionProfile) {
+        profile.knownShortVideoIds().forEach { videoId ->
+            dao.deleteWatch(videoId)
+            dao.deletePendingServerWatchForVideo(videoId)
+        }
+    }
 
     suspend fun enqueueServerWatch(accountKey: String, videoId: String) {
         dao.enqueueServerWatch(
@@ -100,30 +108,103 @@ class HistoryRepository internal constructor(
 
 class HistorySyncer(
     private val history: HistoryRepository,
+    private val companion: CompanionRepository? = null,
 ) {
     suspend fun recordPlayback(
         video: VideoSummary,
         settings: ClientSettings,
         account: AccountSession?,
     ) {
+        if (video.isShort) return
         if (settings.saveWatchHistory) {
             history.recordWatch(video)
         }
-        if (settings.syncAccountHistory && account != null) {
-            history.enqueueServerWatch(account.accountKey, video.videoId)
-            flush(account, settings.proxyMedia)
-        }
+        if (!settings.syncAccountHistory) return
+
+        val syncTarget = resolveSyncTarget(settings.instanceUrl, account) ?: return
+        history.enqueueServerWatch(syncTarget.accountKey, video.videoId)
+        flush(syncTarget, settings.proxyMedia)
     }
 
     suspend fun flush(account: AccountSession, proxyMedia: Boolean) {
-        val pending = history.pendingServerWatches(account.accountKey)
+        flush(
+            ServerHistorySyncTarget(
+                accountKey = account.accountKey,
+                instanceUrl = account.instanceUrl,
+                token = account.token,
+            ),
+            proxyMedia,
+        )
+    }
+
+    private suspend fun resolveSyncTarget(
+        instanceUrl: String,
+        account: AccountSession?,
+    ): ServerHistorySyncTarget? {
+        val normalizedInstance = normalizeInstanceUrl(instanceUrl)
+        val cachedCompanion = companion?.load(normalizedInstance) ?: CompanionState()
+        val activeCompanion = if (cachedCompanion.session != null) {
+            companion?.loadActiveState(normalizedInstance)
+        } else {
+            null
+        }
+        return selectHistorySyncTarget(
+            instanceUrl = normalizedInstance,
+            account = account,
+            cachedCompanion = cachedCompanion,
+            activeCompanion = activeCompanion,
+        )
+    }
+
+    private suspend fun flush(syncTarget: ServerHistorySyncTarget, proxyMedia: Boolean) {
+        val pending = history.pendingServerWatches(syncTarget.accountKey)
         if (pending.isEmpty()) return
-        InvidiousApi(account.instanceUrl, proxyMedia).use { api ->
+        InvidiousApi(
+            baseUrl = syncTarget.instanceUrl,
+            proxyMedia = proxyMedia,
+            deviceBearer = syncTarget.deviceBearer,
+        ).use { api ->
             for (videoId in pending) {
-                val result = api.markWatched(account.token, videoId)
+                val result = api.markWatched(syncTarget.token, videoId)
                 if (result.isFailure) break
-                history.completeServerWatch(account.accountKey, videoId)
+                history.completeServerWatch(syncTarget.accountKey, videoId)
             }
         }
     }
+}
+
+internal data class ServerHistorySyncTarget(
+    val accountKey: String,
+    val instanceUrl: String,
+    val token: String = "",
+    val deviceBearer: String? = null,
+)
+
+internal fun pairedHistoryAccountKey(instanceUrl: String, account: String): String =
+    "paired:${normalizeInstanceUrl(instanceUrl)}:${account.trim()}"
+
+internal fun selectHistorySyncTarget(
+    instanceUrl: String,
+    account: AccountSession?,
+    cachedCompanion: CompanionState,
+    activeCompanion: Result<CompanionState>? = null,
+): ServerHistorySyncTarget? {
+    val normalizedInstance = normalizeInstanceUrl(instanceUrl)
+    if (cachedCompanion.session != null) {
+        val activeSession = activeCompanion?.getOrNull()?.session ?: return null
+        return ServerHistorySyncTarget(
+            accountKey = pairedHistoryAccountKey(activeSession.instanceUrl, activeSession.account),
+            instanceUrl = activeSession.instanceUrl,
+            deviceBearer = activeSession.deviceBearer,
+        )
+    }
+    return account
+        ?.takeIf { normalizeInstanceUrl(it.instanceUrl) == normalizedInstance }
+        ?.let { legacy ->
+            ServerHistorySyncTarget(
+                accountKey = legacy.accountKey,
+                instanceUrl = normalizedInstance,
+                token = legacy.token,
+            )
+        }
 }

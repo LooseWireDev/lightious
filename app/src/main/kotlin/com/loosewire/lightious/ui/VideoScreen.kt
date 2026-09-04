@@ -13,13 +13,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.lifecycle.viewModelScope
 import com.loosewire.lightious.LightiousServices
+import com.loosewire.lightious.cancelDownload
+import com.loosewire.lightious.enqueueDownload
 import com.loosewire.lightious.data.ClientSettings
+import com.loosewire.lightious.data.DownloadKind
+import com.loosewire.lightious.data.DownloadState
+import com.loosewire.lightious.data.DownloadedMedia
 import com.loosewire.lightious.data.InvidiousApi
 import com.loosewire.lightious.data.PlaybackPolicy
 import com.loosewire.lightious.data.StreamSelection
 import com.loosewire.lightious.data.VideoDetails
 import com.loosewire.lightious.data.VideoPlaybackSource
 import com.loosewire.lightious.data.VideoSummary
+import com.loosewire.lightious.data.selectDownloadPlan
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -51,6 +57,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 sealed interface VideoMode {
     data object Loading : VideoMode
@@ -64,13 +71,17 @@ sealed interface VideoMode {
 data class VideoUiState(
     val mode: VideoMode = VideoMode.Loading,
     val errorMessage: String? = null,
+    val checkingAction: Boolean = false,
+    val download: DownloadedMedia? = null,
 )
 
 class VideoViewModel(
-    private val api: InvidiousApi,
+    private val settings: ClientSettings,
     private val audio: LightAudio,
     private val initialVideo: VideoSummary,
     private val services: LightiousServices,
+    private val scheduleDownload: (String, String, DownloadKind) -> Boolean,
+    private val cancelScheduledDownload: (String, String) -> Unit,
 ) : LightViewModel<Unit>() {
     private val player = audio.newPlayer(
         usage = LightAudioUsage.Speech,
@@ -85,99 +96,219 @@ class VideoViewModel(
     val audioPositionMs = player.positionMs
     val audioDurationMs = player.durationMs
     val audioError = player.error
+    private val playbackActionGate = PlaybackActionGate()
     private var playbackRecorded = false
 
     init {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ownerDeviceId = services.companion.load(settings.instanceUrl).session?.deviceId
+                ?: return@launch
+            services.downloads.observeAll().collect { downloads ->
+                _uiState.update { state ->
+                    state.copy(
+                        download = downloads.firstOrNull { download ->
+                            download.ownerDeviceId == ownerDeviceId &&
+                                download.videoId == initialVideo.videoId
+                        },
+                    )
+                }
+            }
+        }
         load()
     }
 
     fun load() {
-        _uiState.value = VideoUiState(mode = VideoMode.Loading)
+        _uiState.update { state -> state.copy(mode = VideoMode.Loading, errorMessage = null) }
         viewModelScope.launch(Dispatchers.IO) {
-            val access = services.companion.authorizePlayback(
-                api.baseUrl,
-                initialVideo.videoId,
-            )
-            if (!access.allowed || access.policy == null) {
-                _uiState.value = VideoUiState(
-                    mode = VideoMode.Failed(
-                        access.message ?: "The companion did not allow this video.",
-                    ),
-                )
-                return@launch
+            when (val resolution = resolvePlayback(FreshPlaybackAction.DISPLAY)) {
+                is FreshPlaybackResolution.Allowed -> {
+                    _uiState.update { state ->
+                        state.copy(mode = VideoMode.Loaded(resolution.details, resolution.policy))
+                    }
+                }
+                is FreshPlaybackResolution.Denied -> {
+                    _uiState.update { state ->
+                        state.copy(mode = VideoMode.Failed(resolution.message))
+                    }
+                }
             }
-            api.video(initialVideo.videoId).fold(
-                onSuccess = { details ->
-                    _uiState.value = VideoUiState(
-                        mode = VideoMode.Loaded(details, access.policy),
-                    )
-                },
-                onFailure = { error ->
-                    _uiState.value = VideoUiState(
-                        mode = VideoMode.Failed(error.message ?: "Could not load this video."),
-                    )
-                },
-            )
         }
     }
 
     fun playAudio() {
-        val details = (_uiState.value.mode as? VideoMode.Loaded)?.details ?: return
-        val audioUrl = details.audioUrl
-        if (audioUrl == null) {
-            _uiState.update { it.copy(errorMessage = "This video has no compatible audio stream.") }
-            return
-        }
+        if (_uiState.value.mode !is VideoMode.Loaded || _audioStarted.value) return
+        if (!beginPlaybackAction()) return
 
         viewModelScope.launch {
-            if (!player.awaitReady()) {
-                _uiState.update { it.copy(errorMessage = "Audio player is unavailable.") }
-                return@launch
+            try {
+                when (val resolution = freshPlayback(FreshPlaybackAction.AUDIO)) {
+                    is FreshPlaybackResolution.Denied -> applyDeniedResolution(resolution)
+                    is FreshPlaybackResolution.Allowed -> {
+                        val details = resolution.details
+                        _uiState.update {
+                            it.copy(
+                                mode = VideoMode.Loaded(details, resolution.policy),
+                                errorMessage = null,
+                            )
+                        }
+                        if (!player.awaitReady()) {
+                            _uiState.update { it.copy(errorMessage = "Audio player is unavailable.") }
+                            return@launch
+                        }
+                        queueAudio(details, resumePositionMs = 0L)
+                        _audioStarted.value = true
+                        player.play()
+                        recordPlayback(details.summary)
+                    }
+                }
+            } finally {
+                finishPlaybackAction()
             }
-            player.setMediaQueue(
-                listOf(
-                    LightAudioItem(
-                        source = LightAudioSource.UrlSource(audioUrl),
-                        metadata = LightMediaMetadata(
-                            title = details.summary.title,
-                            artist = details.summary.author,
-                            album = "Lightious",
-                            durationMs = details.summary.lengthSeconds
-                                .takeIf { it > 0L }
-                                ?.times(1_000L),
-                        ),
-                    ),
-                ),
-            )
-            _audioStarted.value = true
-            player.play()
-            recordPlayback(details.summary)
+        }
+    }
+
+    fun watch(onAuthorized: (VideoDetails, VideoPlaybackSource) -> Unit) {
+        if (_uiState.value.mode !is VideoMode.Loaded) return
+        if (!beginPlaybackAction()) return
+
+        viewModelScope.launch {
+            try {
+                when (val resolution = freshPlayback(FreshPlaybackAction.WATCH)) {
+                    is FreshPlaybackResolution.Denied -> applyDeniedResolution(resolution)
+                    is FreshPlaybackResolution.Allowed -> {
+                        val details = resolution.details
+                        val source = checkNotNull(details.watchSource)
+                        _uiState.update {
+                            it.copy(
+                                mode = VideoMode.Loaded(details, resolution.policy),
+                                errorMessage = null,
+                            )
+                        }
+                        player.pause()
+                        recordPlayback(details.summary)
+                        onAuthorized(details, source)
+                    }
+                }
+            } finally {
+                finishPlaybackAction()
+            }
         }
     }
 
     fun toggleAudio() {
-        if (audioPlaying.value) player.pause() else player.play()
+        if (audioPlaying.value) {
+            player.pause()
+            return
+        }
+        if (!_audioStarted.value || !beginPlaybackAction()) return
+        viewModelScope.launch {
+            try {
+                when (val resolution = freshPlayback(FreshPlaybackAction.AUDIO)) {
+                    is FreshPlaybackResolution.Denied -> applyDeniedResolution(resolution)
+                    is FreshPlaybackResolution.Allowed -> {
+                        val details = resolution.details
+                        val resumePositionMs = player.positionMs.value
+                        _uiState.update {
+                            it.copy(
+                                mode = VideoMode.Loaded(details, resolution.policy),
+                                errorMessage = null,
+                            )
+                        }
+                        if (!player.awaitReady()) {
+                            _uiState.update { it.copy(errorMessage = "Audio player is unavailable.") }
+                            return@launch
+                        }
+                        queueAudio(details, resumePositionMs = resumePositionMs)
+                        player.play()
+                    }
+                }
+            } finally {
+                finishPlaybackAction()
+            }
+        }
     }
 
     fun skipAudioBack() = player.skipBack()
     fun skipAudioForward() = player.skipForward()
-    fun pauseForVideo() = player.pause()
 
-    fun recordVideoPlayback() {
-        val loaded = _uiState.value.mode as? VideoMode.Loaded ?: return
-        if (loaded.playbackPolicy != PlaybackPolicy.WATCH_AND_LISTEN) return
-        val details = loaded.details
-        recordPlayback(details.summary)
+    fun download() {
+        if (_uiState.value.mode !is VideoMode.Loaded || !beginPlaybackAction()) return
+        viewModelScope.launch {
+            try {
+                when (val resolution = freshPlayback(FreshPlaybackAction.DISPLAY)) {
+                    is FreshPlaybackResolution.Denied -> applyDeniedResolution(resolution)
+                    is FreshPlaybackResolution.Allowed -> withContext(Dispatchers.IO) {
+                        val session = services.companion.load(settings.instanceUrl).session
+                            ?: error("Pair this phone before downloading.")
+                        val kind = selectDownloadPlan(
+                            resolution.details,
+                            resolution.policy,
+                            settings.audioLanguage,
+                        ).getOrThrow().kind
+                        services.downloads.queue(session.deviceId, resolution.details.summary, kind)
+                        if (!scheduleDownload(session.deviceId, initialVideo.videoId, kind)) {
+                            services.downloads.markFailed(
+                                session.deviceId,
+                                initialVideo.videoId,
+                                "The background download service is unavailable.",
+                            )
+                        }
+                        _uiState.update { state ->
+                            state.copy(
+                                mode = VideoMode.Loaded(resolution.details, resolution.policy),
+                                errorMessage = null,
+                            )
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _uiState.update {
+                    it.copy(errorMessage = error.userMessage("Could not start the download."))
+                }
+            } finally {
+                finishPlaybackAction()
+            }
+        }
     }
 
+    fun cancelDownload() {
+        val download = _uiState.value.download ?: return
+        cancelScheduledDownload(download.ownerDeviceId, download.videoId)
+        viewModelScope.launch(Dispatchers.IO) {
+            services.downloads.cancel(download.ownerDeviceId, download.videoId)
+        }
+    }
     fun dismissError() {
         _uiState.update { it.copy(errorMessage = null) }
     }
 
     override fun onCleared() {
-        api.close()
         player.release()
         super.onCleared()
+    }
+
+    private fun queueAudio(details: VideoDetails, resumePositionMs: Long) {
+        val audioUrl = checkNotNull(details.audioUrl)
+        player.setMediaQueue(
+            listOf(
+                LightAudioItem(
+                    source = LightAudioSource.UrlSource(audioUrl),
+                    metadata = LightMediaMetadata(
+                        title = details.summary.title,
+                        artist = details.summary.author,
+                        album = "Lightious",
+                        durationMs = details.summary.lengthSeconds
+                            .takeIf { it > 0L }
+                            ?.times(1_000L),
+                    ),
+                ),
+            ),
+        )
+        if (resumePositionMs > 0L) {
+            player.seekTo(resumePositionMs)
+        }
     }
 
     private fun recordPlayback(video: VideoSummary) {
@@ -195,6 +326,78 @@ class VideoViewModel(
             }
         }
     }
+
+    private suspend fun resolvePlayback(action: FreshPlaybackAction): FreshPlaybackResolution =
+        resolveFreshPlayback(
+            videoId = initialVideo.videoId,
+            action = action,
+            fetchDetails = ::fetchDetails,
+            authorize = { details ->
+                services.companion.authorizePlayback(
+                    settings.instanceUrl,
+                    details.summary.videoId,
+                    details.summary.authorId,
+                    details.summary.isShort,
+                )
+            },
+        )
+
+    private suspend fun fetchDetails(videoId: String): Result<VideoDetails> {
+        val companion = services.companion.loadActiveState(settings.instanceUrl).getOrElse { error ->
+            return Result.failure(error)
+        }
+        return InvidiousApi(
+            baseUrl = settings.instanceUrl,
+            proxyMedia = settings.proxyMedia,
+            deviceBearer = companion.session?.deviceBearer,
+            audioLanguage = settings.audioLanguage,
+        ).use { api ->
+            api.video(videoId)
+        }
+    }
+
+    private suspend fun freshPlayback(action: FreshPlaybackAction): FreshPlaybackResolution =
+        withContext(Dispatchers.IO) { resolvePlayback(action) }
+
+    private fun beginPlaybackAction(): Boolean {
+        if (!playbackActionGate.tryAcquire()) return false
+        _uiState.update { it.copy(checkingAction = true, errorMessage = null) }
+        return true
+    }
+
+    private fun finishPlaybackAction() {
+        playbackActionGate.release()
+        _uiState.update { it.copy(checkingAction = false) }
+    }
+
+    private fun applyDeniedResolution(resolution: FreshPlaybackResolution.Denied) {
+        val details = resolution.details
+        val policy = resolution.policy
+        if (resolution.invalidateAudio) {
+            player.pause()
+            player.setMediaQueue(emptyList())
+            _audioStarted.value = false
+        }
+        if (details == null && !resolution.invalidateAudio) {
+            _uiState.update { it.copy(errorMessage = resolution.message) }
+            return
+        }
+        if (details != null && policy != null) {
+            _uiState.update {
+                it.copy(
+                    mode = VideoMode.Loaded(details, policy),
+                    errorMessage = resolution.message,
+                )
+            }
+        } else {
+            _uiState.update {
+                it.copy(
+                    mode = VideoMode.Failed(resolution.message),
+                    errorMessage = null,
+                )
+            }
+        }
+    }
 }
 
 class VideoScreen(
@@ -206,14 +409,16 @@ class VideoScreen(
     override val viewModelClass = VideoViewModel::class.java
 
     override fun createViewModel() = VideoViewModel(
-        api = InvidiousApi(
-            settings.instanceUrl,
-            settings.proxyMedia,
-            settings.audioLanguage,
-        ),
+        settings = settings,
         audio = DefaultLightAudio(sealedActivity),
         initialVideo = initialVideo,
         services = services,
+        scheduleDownload = { ownerDeviceId, videoId, kind ->
+            enqueueDownload(lightContext, ownerDeviceId, videoId, kind)
+        },
+        cancelScheduledDownload = { ownerDeviceId, videoId ->
+            cancelDownload(lightContext, ownerDeviceId, videoId)
+        },
     )
 
     @Composable
@@ -240,6 +445,15 @@ class VideoScreen(
                             contentDescription = "Back",
                         ),
                         center = LightTopBarCenter.Text("Video"),
+                        rightButton = (state.mode as? VideoMode.Loaded)?.let { mode ->
+                            videoDownloadButton(
+                                download = state.download,
+                                desiredKind = mode.playbackPolicy.downloadKind,
+                                checkingAction = state.checkingAction,
+                                onDownload = viewModel::download,
+                                onCancel = viewModel::cancelDownload,
+                            )
+                        },
                     )
 
                     when (val mode = state.mode) {
@@ -257,6 +471,7 @@ class VideoScreen(
                                 audioPositionMs = audioPosition,
                                 audioDurationMs = audioDuration,
                                 audioError = audioError?.let { "${it.kind}: ${it.diagnostic}" },
+                                download = state.download,
                                 modifier = Modifier.weight(1f),
                             )
                             VideoActions(
@@ -264,19 +479,18 @@ class VideoScreen(
                                 playbackPolicy = mode.playbackPolicy,
                                 audioStarted = audioStarted,
                                 audioPlaying = audioPlaying,
-                                onWatch = { source ->
-                                    viewModel.pauseForVideo()
-                                    viewModel.recordVideoPlayback()
-                                    navigateTo(
-                                        screenFactory = { activity ->
-                                            VideoPlaybackScreen(
-                                                sealedActivity = activity,
-                                                title = mode.details.summary.title,
-                                                author = mode.details.summary.author,
-                                                playbackSource = source,
-                                            )
-                                        },
-                                    )
+                                checkingAction = state.checkingAction,
+                                onWatch = {
+                                    viewModel.watch { _, source ->
+                                        navigateTo(
+                                            screenFactory = { activity ->
+                                                VideoPlaybackScreen(
+                                                    sealedActivity = activity,
+                                                    playbackSource = source,
+                                                )
+                                            },
+                                        )
+                                    }
                                 },
                                 onListen = viewModel::playAudio,
                                 onToggleAudio = viewModel::toggleAudio,
@@ -294,6 +508,73 @@ class VideoScreen(
         }
     }
 }
+
+private fun videoDownloadButton(
+    download: DownloadedMedia?,
+    desiredKind: DownloadKind,
+    checkingAction: Boolean,
+    onDownload: () -> Unit,
+    onCancel: () -> Unit,
+): LightBarButton = when (videoDownloadAction(download, desiredKind)) {
+    VideoDownloadAction.CANCEL -> LightBarButton.LightIcon(
+        icon = LightIcons.CLOSE,
+        onClick = onCancel,
+        contentDescription = "Cancel download",
+    )
+    VideoDownloadAction.AVAILABLE -> LightBarButton.LightIcon(
+        icon = LightIcons.DOWNLOAD_ARROW,
+        onClick = null,
+        contentDescription = "Available offline",
+    )
+    VideoDownloadAction.DOWNLOAD,
+    VideoDownloadAction.REPLACE,
+    VideoDownloadAction.RETRY,
+    -> LightBarButton.LightIcon(
+        icon = if (videoDownloadAction(download, desiredKind) == VideoDownloadAction.RETRY) {
+            LightIcons.REFRESH
+        } else {
+            LightIcons.DOWNLOAD_ARROW
+        },
+        onClick = onDownload.takeUnless { checkingAction },
+        contentDescription = when (videoDownloadAction(download, desiredKind)) {
+            VideoDownloadAction.REPLACE -> "Replace with ${desiredKind.wireValue} download"
+            VideoDownloadAction.RETRY -> "Retry download"
+            else -> "Download"
+        },
+    )
+}
+
+internal enum class VideoDownloadAction {
+    DOWNLOAD,
+    REPLACE,
+    RETRY,
+    CANCEL,
+    AVAILABLE,
+}
+
+internal fun videoDownloadAction(
+    download: DownloadedMedia?,
+    desiredKind: DownloadKind,
+): VideoDownloadAction = when (download?.state) {
+    DownloadState.QUEUED,
+    DownloadState.DOWNLOADING,
+    -> VideoDownloadAction.CANCEL
+    DownloadState.COMPLETE -> if (download.kind == desiredKind) {
+        VideoDownloadAction.AVAILABLE
+    } else {
+        VideoDownloadAction.REPLACE
+    }
+    DownloadState.FAILED,
+    DownloadState.CANCELLED,
+    -> VideoDownloadAction.RETRY
+    null -> VideoDownloadAction.DOWNLOAD
+}
+
+private val PlaybackPolicy.downloadKind: DownloadKind
+    get() = when (this) {
+        PlaybackPolicy.LISTEN_ONLY -> DownloadKind.AUDIO
+        PlaybackPolicy.WATCH_AND_LISTEN -> DownloadKind.VIDEO
+    }
 
 @Composable
 private fun VideoLoadingContent(modifier: Modifier = Modifier) {
@@ -341,6 +622,7 @@ private fun VideoDetailsContent(
     audioPositionMs: Long,
     audioDurationMs: Long,
     audioError: String?,
+    download: DownloadedMedia?,
     modifier: Modifier = Modifier,
 ) {
     LightScrollView(
@@ -377,6 +659,21 @@ private fun VideoDetailsContent(
             lighten = true,
             modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()),
         )
+        download?.let { item ->
+            LightText(
+                text = downloadStatusLabel(item),
+                variant = LightTextVariant.Fine,
+                monospace = true,
+                modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
+            )
+            item.errorMessage?.takeIf { item.state != DownloadState.COMPLETE }?.let { message ->
+                LightText(
+                    text = message,
+                    variant = LightTextVariant.Detail,
+                    modifier = Modifier.padding(top = 0.25f.gridUnitsAsDp()),
+                )
+            }
+        }
         if (audioPlaying || audioPositionMs > 0L) {
             LightText(
                 text = "LISTENING  ${playbackTimeLabel(audioPositionMs, audioDurationMs)}",
@@ -410,7 +707,8 @@ private fun VideoActions(
     playbackPolicy: PlaybackPolicy,
     audioStarted: Boolean,
     audioPlaying: Boolean,
-    onWatch: (VideoPlaybackSource) -> Unit,
+    checkingAction: Boolean,
+    onWatch: () -> Unit,
     onListen: () -> Unit,
     onToggleAudio: () -> Unit,
     onSkipBack: () -> Unit,
@@ -434,7 +732,7 @@ private fun VideoActions(
                 add(
                     LightBarButton.LightIcon(
                         icon = if (audioPlaying) LightIcons.PAUSE else LightIcons.PLAY,
-                        onClick = onToggleAudio,
+                        onClick = onToggleAudio.takeUnless { checkingAction && !audioPlaying },
                         contentDescription = if (audioPlaying) "Pause" else "Play",
                     ),
                 )
@@ -445,11 +743,11 @@ private fun VideoActions(
                         contentDescription = "Forward 15 seconds",
                     ),
                 )
-                watchSource?.let { source ->
+                if (watchSource != null) {
                     add(
                         LightBarButton.LightIcon(
                             icon = LightIcons.MEDIA,
-                            onClick = { onWatch(source) },
+                            onClick = onWatch.takeUnless { checkingAction },
                             contentDescription = "Watch video",
                         ),
                     )
@@ -459,13 +757,18 @@ private fun VideoActions(
     } else {
         LightBottomBar(
             items = buildList {
-                watchSource?.let { source ->
-                    add(LightBarButton.Text(text = "WATCH", onClick = { onWatch(source) }))
+                if (watchSource != null) {
+                    add(
+                        LightBarButton.Text(
+                            text = "WATCH",
+                            onClick = onWatch.takeUnless { checkingAction },
+                        ),
+                    )
                 }
                 add(
                     LightBarButton.Text(
                         text = "LISTEN",
-                        onClick = onListen.takeIf { details.audioUrl != null },
+                        onClick = onListen.takeIf { details.audioUrl != null && !checkingAction },
                     ),
                 )
             },

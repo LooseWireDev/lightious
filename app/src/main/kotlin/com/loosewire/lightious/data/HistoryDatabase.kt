@@ -76,6 +76,9 @@ internal interface HistoryDao {
     @Query("DELETE FROM watch_history")
     suspend fun clearWatchHistory()
 
+    @Query("DELETE FROM watch_history WHERE videoId = :videoId")
+    suspend fun deleteWatch(videoId: String)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun enqueueServerWatch(entity: ServerHistoryOutboxEntity)
 
@@ -93,6 +96,9 @@ internal interface HistoryDao {
 
     @Query("DELETE FROM server_history_outbox WHERE accountKey = :accountKey")
     suspend fun clearPendingServerWatches(accountKey: String)
+
+    @Query("DELETE FROM server_history_outbox WHERE videoId = :videoId")
+    suspend fun deletePendingServerWatchForVideo(videoId: String)
 
     @Transaction
     suspend fun clearWatchHistoryAndPending(accountKey: String?) {

@@ -1,10 +1,18 @@
 package com.loosewire.lightious.ui
 
 import com.loosewire.lightious.data.VideoSummary
+import com.loosewire.lightious.data.FocusedLibraryFilter
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class VideoRowsTest {
+    @Test
+    fun usesFocusedAudioVideoFilterLabels() {
+        assertEquals("ALL", FocusedLibraryFilter.ALL.filterLabel())
+        assertEquals("AUDIO", FocusedLibraryFilter.LISTEN.filterLabel())
+        assertEquals("VIDEO", FocusedLibraryFilter.WATCH.filterLabel())
+    }
+
     @Test
     fun formatsDurationAndCountsForSmallScreen() {
         assertEquals("4:05", formatSeconds(245L))
