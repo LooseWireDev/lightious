@@ -12,7 +12,7 @@ companion explicitly selects Explore mode and that page is enabled.
 
 - Search for videos or open a YouTube URL.
 - Open an optional signed-in Invidious account feed.
-- Watch a low-bandwidth progressive stream, with HLS support for live video.
+- Watch a low-bandwidth progressive stream while preserving its native aspect ratio.
 - Listen through the Light SDK audio player, including detached playback.
 - Keep optional local search and watch histories.
 - Choose which pages appear on Home.
@@ -31,6 +31,8 @@ companion explicitly selects Explore mode and that page is enabled.
   offline playback, and confirmed deletion from a Downloads tab.
 - Preserve native video aspect ratios and provide an explicit screen-filling
   fullscreen view without stretching or cropping.
+- Exclude YouTube Shorts from search, libraries, playlists, history, playback,
+  and downloads.
 
 There is no autoplay, comments, algorithmic Home feed, notifications, or
 automatic public-instance rotation.
@@ -168,14 +170,15 @@ and a playable media URL. Companion pairing additionally requires the
 [`lightious` branch of `LooseWireDev/lightious-invidious`](https://github.com/LooseWireDev/lightious-invidious/tree/lightious)
 with its Lightious routes enabled and public HTTPS URL configured.
 
-`Proxy media` requests `local=true`. This keeps media traffic on the configured
-Invidious host but consumes that server's bandwidth. Turning it off normally
-uses the returned Google video CDN URL directly.
+Paired playback always uses the server's short-lived, signed media gateway.
+`Proxy media` applies only to unpaired or custom Explore-mode playback: enabling
+it requests `local=true`, while disabling it normally uses the returned Google
+video CDN URL directly. Protected live/HLS playback is not yet available.
 
 ## Compatibility status
 
 The UI, navigation, input, theming, and audio path use Light SDK components.
-Video rendering uses Media3 and an Android `SurfaceView`, so Lightious is an
+Video rendering uses Media3 and an Android `TextureView`, so Lightious is an
 experimental sideloaded tool rather than an officially supported Light tool.
 
 Materialious and Clipious were used only as behavioral references for the
