@@ -4,9 +4,9 @@ Lightious is a small, text-first Invidious client for Light Phone III. It is a
 clean-room Kotlin application built on the Light SDK—not a Clipious or
 Materialious fork or wrapper.
 
-The launch screen is an offline menu and never loads a recommendation feed on
-its own. Popular videos are hidden by default and are requested only if that
-page is explicitly enabled and opened.
+The launch screen is a pairing-first Focused library and never loads a
+recommendation feed on its own. Popular videos are available only when a paired
+companion explicitly selects Explore mode and that page is enabled.
 
 ## Features
 
@@ -18,9 +18,19 @@ page is explicitly enabled and opened.
 - Choose which pages appear on Home.
 - Select an app-wide preferred audio language.
 - Choose whether media is proxied through the configured Invidious instance.
-- Pair with the companion website using a short code—no token entry on the phone.
+- Pair with the companion website using a 12-character code—no token entry on the phone.
 - Switch between unrestricted Explore and an explicitly curated Focused library.
-- Allow each Focused item to be listened to only or watched and listened to.
+- Browse Focused videos, allowed channels, and private Lightious playlists from
+  LightOS-style bottom navigation.
+- Search videos, audio, channels, playlist names and contents, and downloaded
+  titles from one library search.
+- Filter each Focused view by all, audio-only, or video-enabled items.
+- Allow each selected video or whole channel to be listened to only or watched
+  and listened to.
+- Download approved media to app-private storage, with progress, cancel, retry,
+  offline playback, and confirmed deletion from a Downloads tab.
+- Preserve native video aspect ratios and provide an explicit screen-filling
+  fullscreen view without stretching or cropping.
 
 There is no autoplay, comments, algorithmic Home feed, notifications, or
 automatic public-instance rotation.
@@ -104,15 +114,42 @@ checksum, and publishes the APK and checksum to GitHub Releases.
 ## Companion pairing and account sign-in
 
 The companion-enabled Invidious fork exposes `/lightious`. Sign in there with a
-normal Invidious account, select Explore or Focused mode, add individual videos,
-choose each video's playback permission, and approve a phone using the short
-code displayed by Lightious.
+normal Invidious account, select Explore or Focused mode, search for videos and
+channels, add one result or a multi-selection, and arrange added videos into
+private Lightious playlists. Search results never play on the companion site.
+Each selected video or whole channel gets an audio-only or video-enabled policy.
+Approve a phone using the 12-character code displayed by Lightious.
 
 The phone creates its own random device credential and sends only its SHA-256
 digest when pairing begins. The credential is stored with AES-GCM encryption
 backed by the Android Keystore. Browser session cookies and account passwords
 never enter the phone app. A paired phone refreshes companion policy before
-opening a video; Focused mode denies videos not in the current curated library.
+showing a video and rechecks it with fresh media metadata before every audio or
+video start, including resuming paused audio. Focused mode allows an exact
+selected video or a video whose authoritatively reported channel is explicitly
+allowed; an exact video policy overrides the channel default. Playlist
+membership grants access only to that exact playlist item and never infers or
+grants broader channel access.
+
+Downloads follow the currently verified policy. Listen-only items save one
+adaptive audio stream; video-enabled items save one muxed progressive stream
+at 720p or below. Live/HLS media and separate adaptive video-plus-audio tracks
+are not downloaded. If an app-wide language choice requires a separate adaptive
+audio track, Lightious refuses to silently save a muxed video with different
+audio and directs the user to save that item as listen-only instead. The
+background job fetches fresh protected metadata and
+re-resolves its short-lived signed media URL instead of persisting that URL.
+Partial transfers can resume only when the stable stream identity still
+matches; otherwise the partial file is discarded to avoid splicing formats.
+Transient network and server failures retry through LightWork while retaining a
+compatible partial transfer; user cancellation and deletion clean it up.
+Downloaded files live under the app's private files directory and require no
+broad storage permission.
+
+Offline bytes cannot be recalled until the phone reconnects. After a successful
+sync removes access, downgrades a video to listen-only, or confirms that the
+pairing was revoked, Lightious deletes incompatible local copies. Explicitly
+forgetting the companion on the phone also deletes that pairing's downloads.
 
 The existing restricted Invidious bearer-token sign-in remains optional for
 Explore-mode account feeds and watched-history sync. It is separate from the
